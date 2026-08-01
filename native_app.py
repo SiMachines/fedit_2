@@ -26,6 +26,8 @@ else:
     base_path = os.path.dirname(os.path.abspath(__file__))
     sys.path.append(os.path.join(base_path, '.dependencies'))
 from server.ffb_engine import engine, DeviceInfo
+from server.serial_manager import serial_manager, scan_ports
+from server.sweep_engine import sweep_engine, SweepConfig, SweepData
  
 # --- Data Model ---
 @dataclass
@@ -472,13 +474,20 @@ class MotorBusterNativeApp:
         self._mouse_status_visible = True
         self._drag_fps_override_hz = 0
         self._pending_scroll_x = None # For deferred zoom scrolling
-        self.freeze_test_active = False # For diagnostic freeze test
-        self._should_trigger_freeze_now = False # Immediate freeze trigger for HW mode start
-        self._freeze_cycle_phase = "pause"
-        self._freeze_cycle_phase_end = 0.0
         self._last_logged_freq_output = None
         
-        # Probe State
+        # Serial Port State
+        self.serial_ports = []
+        self.serial_selected_port = None
+        self.serial_baud = 115200
+        self.serial_connected = False
+        self.serial_timing_data = {}
+        
+        # Diagnostic state (still referenced by UI)
+        self.freeze_test_active = False
+        self._should_trigger_freeze_now = False
+        self._freeze_cycle_phase = "pause"
+        self._freeze_cycle_phase_end = 0.0
         self._probe_thread = None
         self._probe_feedback_event = threading.Event()
         self._probe_feedback_result = None
@@ -517,6 +526,15 @@ class MotorBusterNativeApp:
         self.stats_min = 0.0
         self.stats_sum = 0.0
         self.stats_count = 0
+
+        # Initialize sweep engine callbacks
+        sweep_engine.set_callbacks(
+            on_send_effect=self._sweep_engine_send_effect,
+            on_send_stop=self._sweep_engine_send_stop,
+            on_progress=self._sweep_engine_progress,
+            on_complete=self._sweep_engine_complete,
+            on_log=self._sweep_engine_log,
+        )
 
     @staticmethod
     def _clip_is_infinite(clip: Clip | None) -> bool:
@@ -854,11 +872,47 @@ class MotorBusterNativeApp:
         else:
             dpg.set_value("device_combo", "No Devices Found")
 
+    def _get_device_guid(self) -> Optional[str]:
+        """Get the GUID of the currently connected device."""
+        try:
+            dev = engine.get_connected_device()
+            if dev and hasattr(dev, 'guid'):
+                return str(dev.guid)
+        except:
+            pass
+        return None
+
     def _get_torque_for_device(self, name: str) -> float:
-        """Returns known max torque (Nm) for common devices base name."""
+        """Detect max torque via GUID lookup + user override persistence."""
+        # 1. Check user overrides (persisted GUID → Nm)
+        guid = self._get_device_guid()
+        if guid and hasattr(self, '_device_torque_overrides') and guid in self._device_torque_overrides:
+            return self._device_torque_overrides[guid]
+
+        # 2. GUID-based accurate lookup
+        GUID_TORQUE_DB = {
+            # Simucube
+            "{AEB1D5C2-EA62-44F0-A05C-80E5D9E306D2}": 32.0,   # SC2 Ultimate
+            "{AEB1D5C2-EA62-44F0-A05C-80E5D9E306D1}": 25.0,   # SC2 Pro
+            "{AEB1D5C2-EA62-44F0-A05C-80E5D9E306D0}": 17.0,   # SC2 Sport
+            # Fanatec
+            "{0007-0000-0000-0000-504944564944}": 25.0,        # DD2
+            "{0006-0000-0000-0000-504944564944}": 20.0,        # DD1
+            "{0020-0000-0000-0000-504944564944}": 8.0,         # CSL DD
+            # Moza
+            "{0005-0000-0000-0000-504944564944}": 21.0,        # R21
+            "{0004-0000-0000-0000-504944564944}": 16.0,        # R16
+            "{0003-0000-0000-0000-504944564944}": 12.0,        # R12
+            "{0002-0000-0000-0000-504944564944}": 9.0,         # R9
+            "{0001-0000-0000-0000-504944564944}": 5.5,         # R5
+        }
+        
+        if guid and guid.upper() in GUID_TORQUE_DB:
+            return GUID_TORQUE_DB[guid.upper()]
+
+        # 3. Name-based fallback (for devices without known GUIDs)
         name_lower = name.lower()
-        # Lookup Table
-        db = {
+        NAME_DB = {
             "simucube 2 ultimate": 32.0,
             "simucube 2 pro": 25.0,
             "simucube 2 sport": 17.0,
@@ -882,20 +936,35 @@ class MotorBusterNativeApp:
             "asetek la prima": 12.0,
             "conspit ares platinum": 20.0,
             "conspit ares apex": 8.0,
-            "conspit ares": 20.0,
+            "conspit ares": 10.0,
         }
-        
-        # Substring match - Find Longest Match
         best_val = 0.0
         max_len = 0
-        
-        for key, val in db.items():
+        for key, val in NAME_DB.items():
             if key in name_lower:
                 if len(key) > max_len:
                     max_len = len(key)
                     best_val = val
-                    
         return best_val
+
+    def _save_device_torque_override(self, guid: str, torque_nm: float):
+        """Persist user torque override to settings file keyed by device GUID."""
+        if not hasattr(self, '_device_torque_overrides'):
+            self._device_torque_overrides = {}
+        self._device_torque_overrides[guid] = torque_nm
+        # Save to settings
+        try:
+            import json, os
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_settings.json")
+            settings = {}
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    settings = json.load(f)
+            settings["device_torque_overrides"] = self._device_torque_overrides
+            with open(path, 'w') as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            self.log(f"Failed to save torque override: {e}")
 
     def connect_device_by_name(self, name):
          try:
@@ -1089,6 +1158,308 @@ class MotorBusterNativeApp:
         # For now, we'll just log it. The user can see it in clips.
         rec = engine.recommendation_hw_sine
         self.log(f"Global Recommendation: {'HARDWARE' if rec else 'NOT SUPPORTED'} SINE")
+
+    # --- Serial Port Methods ---
+    def _scan_serial_ports(self, sender=None, app_data=None):
+        """Scan available serial ports and update the combo."""
+        ports = scan_ports()
+        self.serial_ports = ports
+        items = [p["description"] for p in ports]
+        if items:
+            dpg.configure_item("serial_port_combo", items=items)
+            dpg.set_value("serial_port_combo", items[0])
+            self.serial_selected_port = ports[0]["port"]
+            self.log(f"Found {len(ports)} serial port(s)")
+        else:
+            dpg.configure_item("serial_port_combo", items=["No ports found"])
+            dpg.set_value("serial_port_combo", "No ports found")
+            self.log("No serial ports found")
+
+    def _on_serial_port_selected(self, sender, app_data):
+        """Called when user selects a port from the combo."""
+        for p in self.serial_ports:
+            if p["description"] == app_data:
+                self.serial_selected_port = p["port"]
+                break
+
+    def _on_serial_baud_changed(self, sender, app_data):
+        """Called when baud rate changes."""
+        try:
+            self.serial_baud = int(app_data)
+        except:
+            self.serial_baud = 115200
+
+    def _connect_serial(self, sender=None, app_data=None):
+        """Connect or disconnect the serial port."""
+        if self.serial_connected:
+            serial_manager.disconnect()
+            self.serial_connected = False
+            dpg.configure_item("btn_serial_connect", label="Connect")
+            dpg.configure_item("txt_serial_status", color=(100, 100, 100))
+            dpg.set_value("txt_serial_status", "COM: Offline")
+            self.log("Serial disconnected")
+            return
+
+        port = self.serial_selected_port
+        if not port:
+            self.log("No serial port selected")
+            return
+
+        if serial_manager.connect(port, self.serial_baud):
+            self.serial_connected = True
+            dpg.configure_item("btn_serial_connect", label="Disconnect")
+            dpg.configure_item("txt_serial_status", color=(100, 255, 100))
+            dpg.set_value("txt_serial_status", f"COM: {port} ({self.serial_baud})")
+            self.log(f"Serial connected to {port} @ {self.serial_baud} baud")
+            serial_manager.set_response_callback(self._on_serial_response)
+        else:
+            self.log(f"Failed to connect to {port}")
+
+    def _on_serial_response(self, data: dict):
+        """Callback when serial response is received from MCU."""
+        self.serial_timing_data = data
+        delta_ms = data.get("delta_ms", 0)
+        t1 = data.get("t1", 0)
+        t2 = data.get("t2", 0)
+        if dpg.does_item_exist("txt_serial_timing"):
+            color = (100, 255, 100) if delta_ms < 1 else (255, 255, 100) if delta_ms < 5 else (255, 100, 100)
+            dpg.set_value("txt_serial_timing", f"Δ = {delta_ms:.3f} ms | T1={t1} T2={t2}")
+            dpg.configure_item("txt_serial_timing", color=color)
+        self.log(f"Serial Response: Δ={delta_ms:.3f}ms")
+
+    # --- Sweep Panel Methods ---
+    def _on_sweep_torque_slider(self, sender, app_data):
+        """Update the torque readout when slider moves."""
+        pct = int(app_data) if app_data is not None else 0
+        max_nm = 25.0
+        if dpg.does_item_exist("sweep_max_torque"):
+            max_nm = dpg.get_value("sweep_max_torque")
+        actual_nm = max_nm * pct / 100.0
+        if dpg.does_item_exist("txt_sweep_torque_readout"):
+            dpg.set_value("txt_sweep_torque_readout", f"{pct}% ({actual_nm:.1f} Nm)")
+
+    def _update_sweep_torque_display(self):
+        """Update the torque display fields from the connected device."""
+        if not dpg.does_item_exist("sweep_max_torque"):
+            return
+        detected_torque = 25.0
+        try:
+            name = dpg.get_value("device_combo")
+            if name and "No Devices" not in name:
+                detected_torque = self._get_torque_for_device(name)
+                if detected_torque <= 0:
+                    detected_torque = 25.0
+        except:
+            pass
+        dpg.set_value("sweep_max_torque", detected_torque)
+        self._on_sweep_torque_slider(None, dpg.get_value("sweep_torque_pct"))
+
+    def _open_sweep_panel(self, sender=None, app_data=None):
+        """Open the Create Sinestream Sweep dialog window."""
+        # Delete stale cached window to ensure fresh UI
+        if dpg.does_item_exist("win_sweep_v2"):
+            dpg.delete_item("win_sweep_v2")
+
+        width, height = 650, 580
+        vp_w = dpg.get_viewport_width()
+        vp_h = dpg.get_viewport_height()
+        pos = [(vp_w - width) // 2, (vp_h - height) // 2]
+        
+        with dpg.window(tag="win_sweep_v2", label="Sinestream Sweep", width=width, height=height,
+                        pos=pos, modal=False, no_resize=False, on_close=lambda: None):
+            
+            dpg.add_text("Frequency Range", color=(200, 200, 255))
+            dpg.add_separator()
+
+            with dpg.group(horizontal=True):
+                dpg.add_text("Min (Hz):")
+                dpg.add_input_float(tag="sweep_freq_min", default_value=10.0, width=100, step=0)
+                dpg.add_spacer(width=20)
+                dpg.add_text("Max (Hz):")
+                dpg.add_input_float(tag="sweep_freq_max", default_value=500.0, width=100, step=0)
+            with dpg.group(horizontal=True):
+                dpg.add_text("No. of frequencies:")
+                dpg.add_input_int(tag="sweep_num_freq", default_value=20, width=100, min_value=2, max_value=200)
+
+            dpg.add_text("")
+            dpg.add_text("Signal Configuration", color=(180, 180, 200))
+            dpg.add_separator()
+
+            # Max Torque (auto-detected, editable)
+            with dpg.group(horizontal=True):
+                dpg.add_text("Max Torque (Nm):")
+                dpg.add_input_float(tag="sweep_max_torque", default_value=25.0, width=100, min_value=0.1, max_value=100.0, step=0)
+                dpg.add_text("(auto-detected)", color=(140, 140, 140))
+
+            # Torque Slider (0-100%) with live Nm readout
+            with dpg.group(horizontal=True):
+                dpg.add_text("Torque:")
+                dpg.add_slider_int(tag="sweep_torque_pct", default_value=10, min_value=0, max_value=100, width=300,
+                                   callback=self._on_sweep_torque_slider)
+                dpg.add_text("10% (2.5 Nm)", tag="txt_sweep_torque_readout", color=(180, 220, 180))
+
+            with dpg.group(horizontal=True):
+                dpg.add_text("Settling periods:")
+                dpg.add_input_int(tag="sweep_settling", default_value=2, width=80, min_value=0, max_value=20)
+                dpg.add_spacer(width=15)
+                dpg.add_text("Num periods:")
+                dpg.add_input_int(tag="sweep_periods", default_value=5, width=80, min_value=1, max_value=50)
+                dpg.add_spacer(width=15)
+                dpg.add_text("Ramp periods:")
+                dpg.add_input_int(tag="sweep_ramp", default_value=1, width=80, min_value=0, max_value=10)
+
+            dpg.add_separator()
+
+            # Frequency list text display and preview
+            with dpg.group(horizontal=True):
+                dpg.add_text("Frequencies:", color=(200, 200, 255))
+                dpg.add_button(label="Preview", width=80, callback=self._sweep_preview_freqs)
+            
+            dpg.add_text("", tag="txt_sweep_freqs", wrap=580, color=(180, 220, 180))
+            
+            # Progress & Log area
+            dpg.add_progress_bar(tag="sweep_progress", width=-1, default_value=0.0)
+            dpg.add_text("Status: Ready", tag="txt_sweep_status", color=(200, 200, 200))
+
+            # Action buttons
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Run Sweep", tag="btn_sweep_run", width=120, callback=self._sweep_run)
+                dpg.add_button(label="Cancel", tag="btn_sweep_cancel", width=120, enabled=False, callback=self._sweep_cancel)
+                dpg.add_button(label="Export JSON", tag="btn_sweep_export", width=120, enabled=False, callback=self._sweep_export)
+                dpg.add_button(label="Close", width=80, callback=lambda: dpg.delete_item("win_sweep_v2"))
+
+        # Initialize sweep engine callbacks
+        sweep_engine.set_callbacks(
+            on_send_effect=self._sweep_engine_send_effect,
+            on_send_stop=self._sweep_engine_send_stop,
+            on_progress=self._sweep_engine_progress,
+            on_complete=self._sweep_engine_complete,
+            on_log=self._sweep_engine_log,
+        )
+
+        # Set initial torque values from device detection
+        self._update_sweep_torque_display()
+
+    def _sweep_preview_freqs(self, sender=None, app_data=None):
+        """Preview the generated frequency list."""
+        config = self._sweep_get_config()
+        if config is None:
+            return
+        freqs = config.get_frequencies()
+        if len(freqs) > 50:
+            shown = [f"{f:.2f}" for f in freqs[:25]] + ["..."] + [f"{f:.2f}" for f in freqs[-5:]]
+        else:
+            shown = [f"{f:.2f}" for f in freqs]
+        preview = ", ".join(shown)
+        if dpg.does_item_exist("txt_sweep_freqs"):
+            dpg.set_value("txt_sweep_freqs", f"{len(freqs)} frequencies: [{preview}] Hz")
+
+    def _sweep_get_config(self) -> Optional[SweepConfig]:
+        """Read sweep panel UI values into a SweepConfig."""
+        try:
+            config = SweepConfig()
+            config.freq_min_hz = dpg.get_value("sweep_freq_min")
+            config.freq_max_hz = dpg.get_value("sweep_freq_max")
+            config.num_frequencies = dpg.get_value("sweep_num_freq")
+            
+            # Always logarithmic spacing (hardcoded default)
+            config.spacing = "logarithmic"
+
+            # Compute amplitude from torque percentage
+            torque_pct = dpg.get_value("sweep_torque_pct")
+            config.amplitude = int(32767 * torque_pct / 100.0)
+
+            # Max torque from UI
+            config.max_torque_nm = dpg.get_value("sweep_max_torque")
+
+            config.settling_periods = dpg.get_value("sweep_settling")
+            config.num_periods = dpg.get_value("sweep_periods")
+            config.ramp_periods = dpg.get_value("sweep_ramp")
+            config.perform_filtering = True  # Always enabled
+            
+            return config
+        except Exception as e:
+            self.log(f"Sweep config error: {e}")
+            return None
+
+    def _sweep_run(self, sender=None, app_data=None):
+        """Run the sweep with current UI config."""
+        if not self.serial_connected:
+            self.log("Serial not connected. Cannot run sweep without MCU connection.")
+            return
+
+        if sweep_engine.is_running:
+            self.log("Sweep already running")
+            return
+
+        config = self._sweep_get_config()
+        if config is None:
+            return
+
+        # Update UI state
+        dpg.configure_item("btn_sweep_run", enabled=False)
+        dpg.configure_item("btn_sweep_cancel", enabled=True)
+        dpg.configure_item("btn_sweep_export", enabled=False)
+        dpg.set_value("sweep_progress", 0.0)
+        dpg.set_value("txt_sweep_status", "Status: Running...")
+
+        # Route serial responses to sweep engine
+        serial_manager.set_response_callback(sweep_engine.handle_response)
+
+        # Start the sweep
+        sweep_engine.run_sweep(config)
+
+    def _sweep_cancel(self, sender=None, app_data=None):
+        """Cancel the running sweep."""
+        sweep_engine.cancel_sweep()
+        dpg.set_value("txt_sweep_status", "Status: Cancelling...")
+
+    def _sweep_export(self, sender=None, app_data=None):
+        """Export sweep results."""
+        sweep_engine.export_results("motorbuster_sweep_results.json")
+
+    def _sweep_engine_send_effect(self, effect_type: str, freq_hz: float, magnitude: int, duration_ms: int,
+                                  max_torque_nm: float = 25.0,
+                                  settle_periods: int = 2,
+                                  num_periods: int = 5,
+                                  ramp_periods: int = 1) -> Optional[int]:
+        """Called by sweep engine to send an effect over serial."""
+        if self.serial_connected:
+            return serial_manager.send_effect(effect_type, freq_hz, magnitude, duration_ms,
+                                              max_torque_nm, settle_periods, num_periods, ramp_periods)
+        return None
+
+    def _sweep_engine_send_stop(self):
+        """Called by sweep engine to send stop."""
+        if self.serial_connected:
+            serial_manager.send_stop()
+
+    def _sweep_engine_progress(self, current: int, total: int, label: str):
+        """Called by sweep engine to report progress."""
+        if dpg.does_item_exist("sweep_progress"):
+            dpg.set_value("sweep_progress", current / max(1, total))
+        if dpg.does_item_exist("txt_sweep_status"):
+            dpg.set_value("txt_sweep_status", f"Status: {current}/{total} - {label}")
+
+    def _sweep_engine_complete(self, data: SweepData):
+        """Called by sweep engine on completion."""
+        # Restore normal serial callback
+        serial_manager.set_response_callback(self._on_serial_response)
+
+        if dpg.does_item_exist("txt_sweep_status"):
+            status = data.status.capitalize()
+            valid = len([r for r in data.results if r.valid])
+            dpg.set_value("txt_sweep_status", f"Status: {status} ({valid}/{len(data.results)} valid)")
+        if dpg.does_item_exist("btn_sweep_run"):
+            dpg.configure_item("btn_sweep_run", enabled=True)
+        if dpg.does_item_exist("btn_sweep_cancel"):
+            dpg.configure_item("btn_sweep_cancel", enabled=False)
+        if dpg.does_item_exist("btn_sweep_export"):
+            dpg.configure_item("btn_sweep_export", enabled=True)
+
+    def _sweep_engine_log(self, msg: str):
+        """Called by sweep engine for log messages."""
+        self.log(f"[Sweep] {msg}")
 
     # --- Torque Telemetry ---
     def calculate_current_force(self):
@@ -3241,158 +3612,45 @@ class MotorBusterNativeApp:
                 # Fallback to default
                 dpg.bind_font(dpg.mvFont_Default)
 
-    def apply_theme(self, mode):
+    def apply_theme(self, mode="Dark Mode"):
         self.current_theme_mode = mode
-        # self.save_settings() # Method not present in current native_app.py
-        
-        # Update Menu Checkmarks
-        themes = ["Classic", "Dark Mode", "Retro"]
-        for t in themes:
-            tag = f"menu_theme_{t}"
-            if dpg.does_item_exist(tag):
-                dpg.set_value(tag, t == mode)
 
-        # define colors
-        if mode == "Dark Mode":
-             cols = {
-                 "grid_line": (60, 60, 60, 100),
-                 "track_bg_even": (40, 40, 45, 50),
-                 "track_bg_odd": (35, 35, 40, 50),
-                 "track_border": (60, 60, 60),
-                 "text_track": (200, 200, 200),
-                 "clip_sine": (100, 150, 255),
-                 "clip_const": (150, 255, 100),
-                 "clip_ramp": (255, 150, 100),
-                 "clip_saw": (255, 100, 100),
-                 "ruler_bg": (30, 30, 35),
-                 "ruler_border": (60, 60, 60),
-                 "ruler_line": (100, 100, 100),
-                 "ruler_tick": (150, 150, 150),
-                 "ruler_text": (200, 200, 200),
-                 "playhead": (255, 50, 50),
-                 "playhead_fill": (255, 100, 100),
-                 "text_green": (0, 255, 0),
-             }
-             
-             # Global UI Colors (Dark)
-             ui = {
-                 "win_bg": (20, 20, 25),
-                 "text": (220, 220, 220),
-                 "btn": (45, 45, 50),
-                 "btn_hov": (60, 60, 65),
-                 "btn_act": (80, 80, 85),
-                 "frame_bg": (30, 30, 35),
-                 "frame_hov": (40, 40, 45),
-                 "menu_bg": (30, 30, 35),
-                 "popup_bg": (30, 30, 35),
-                 "border": (60, 60, 60),
-                 "check": (100, 150, 255),
-                 "link_color": (100, 200, 255),
-             }
+        # Dark Mode — the only theme
+        cols = {
+             "grid_line": (60, 60, 60, 100),
+             "track_bg_even": (40, 40, 45, 50),
+             "track_bg_odd": (35, 35, 40, 50),
+             "track_border": (60, 60, 60),
+             "text_track": (200, 200, 200),
+             "clip_sine": (100, 150, 255),
+             "clip_const": (150, 255, 100),
+             "clip_ramp": (255, 150, 100),
+             "clip_saw": (255, 100, 100),
+             "ruler_bg": (30, 30, 35),
+             "ruler_border": (60, 60, 60),
+             "ruler_line": (100, 100, 100),
+             "ruler_tick": (150, 150, 150),
+             "ruler_text": (200, 200, 200),
+             "playhead": (255, 50, 50),
+             "playhead_fill": (255, 100, 100),
+             "text_green": (0, 255, 0),
+         }
+         
+        ui = {
+             "win_bg": (20, 20, 25),
+             "text": (220, 220, 220),
+             "btn": (45, 45, 50),
+             "btn_hov": (60, 60, 65),
+             "btn_act": (80, 80, 85),
+             "frame_bg": (30, 30, 35),
+             "frame_hov": (40, 40, 45),
+             "menu_bg": (30, 30, 35),
+             "popup_bg": (30, 30, 35),
+             "border": (60, 60, 60),
+             "check": (100, 150, 255),
+             "link_color": (100, 200, 255),
+         }
 
-        elif mode == "Retro":
-             # Retro / Sunset Palette
-             orange_accent = (255, 145, 40)
-             deep_bg = (40, 35, 42)
-             lighter_bg = (55, 50, 60)
-             
-             cols = {
-                 "grid_line": (80, 70, 90, 80),
-                 "track_bg_even": (45, 40, 48, 200),
-                 "track_bg_odd": (40, 35, 42, 200),
-                 "track_border": (70, 60, 80),
-                 "text_track": (200, 180, 170),
-                 "clip_sine": orange_accent,      # Main Accent
-                 "clip_const": (255, 200, 60),    # Yellow
-                 "clip_ramp": (255, 90, 60),      # Red-Orange
-                 "clip_saw": (200, 60, 60),       # Deep Red
-                 "ruler_bg": (35, 30, 38),
-                 "ruler_border": (70, 60, 80),
-                 "ruler_text": (180, 170, 160),
-                 "timeline_bg": (30, 25, 32),
-                 "playhead": (255, 220, 100),
-                 "playhead_fill": (255, 180, 50),
-                 "text_green": (255, 160, 60), # Status Orange
-             }
-             
-             ui = {
-                 "win_bg": deep_bg,
-                 "text": (240, 230, 225),
-                 "btn": lighter_bg,
-                 "btn_hov": (75, 70, 85),
-                 "btn_act": orange_accent,
-                 "frame_bg": (30, 25, 32),
-                 "frame_hov": (60, 55, 65),
-                 "check": orange_accent,
-                 "border": (80, 70, 90),
-                 "menu_bg": (35, 30, 38),
-                 "popup_bg": (45, 40, 48),
-                 "scrollbar_bg": (30, 25, 32),
-                 "scrollbar_grab": (70, 60, 75),
-                 "scrollbar_grab_hov": (90, 80, 95),
-                 "scrollbar_grab_act": orange_accent,
-                 "header": (255, 145, 40, 150),
-                 "header_hover": (255, 160, 60, 180),
-                 "header_active": orange_accent,
-                 "tab": deep_bg,
-                 "tab_hov": (60, 55, 65),
-                 "tab_act": orange_accent,
-                 "tab_act": orange_accent,
-                 "tab_act_unfocused": (200, 120, 30),
-                 "link_color": orange_accent,
-             }
-
-        elif mode == "Classic":
-             # Warm Paper / Sage Palette (Classic)
-             sage_accent = (100, 150, 110)
-             paper_bg = (245, 245, 240)   # Warm off-white
-             darker_paper = (235, 235, 230)
-             white_paper = (252, 252, 250)
-             
-             cols = {
-                 "grid_line": (180, 180, 175, 120),
-                 "track_bg_even": (240, 240, 235, 255),
-                 "track_bg_odd": (230, 230, 225, 255),
-                 "track_border": (200, 200, 195),
-                 "text_track": (60, 60, 65),
-                 "clip_sine": sage_accent,        # Sage
-                 "clip_const": (100, 120, 130),   # Slate
-                 "clip_ramp": (180, 100, 80),     # Muted Clay
-                 "clip_saw": (200, 120, 100),     # Terracotta
-                 "ruler_bg": darker_paper,
-                 "ruler_border": (190, 190, 185),
-                 "ruler_text": (70, 70, 75),
-                 "timeline_bg": paper_bg,
-                 "playhead": (40, 40, 45),        # Charcoal
-                 "playhead_fill": (80, 80, 85),
-                 "text_green": (60, 120, 70),     # Dark Green
-             }
-             
-             ui = {
-                 "win_bg": paper_bg,
-                 "text": (40, 40, 45),
-                 "btn": white_paper,
-                 "btn_hov": (230, 230, 225),
-                 "btn_act": sage_accent,
-                 "frame_bg": white_paper,
-                 "frame_hov": (230, 230, 225),
-                 "check": sage_accent,
-                 "border": (200, 200, 195),
-                 "menu_bg": paper_bg,
-                 "popup_bg": white_paper,
-                 "scrollbar_bg": paper_bg,
-                 "scrollbar_grab": (180, 180, 175),
-                 "scrollbar_grab_hov": (160, 160, 155),
-                 "scrollbar_grab_act": sage_accent,
-                 "header": (235, 235, 230),
-                 "header_hover": (225, 225, 220),
-                 "header_active": sage_accent,
-                 "tab": paper_bg,
-                 "tab_hov": (235, 235, 230),
-                 "tab_act": sage_accent,
-                 "tab_act_unfocused": (130, 160, 140),
-                 "link_color": sage_accent,
-             }
 
         self.theme_colors = cols
         
@@ -3569,6 +3827,10 @@ class MotorBusterNativeApp:
             with dpg.theme_component(dpg.mvCombo):
                 dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 3, 8, category=dpg.mvThemeCat_Core)
 
+        with dpg.theme(tag="theme_inspector_panel"):
+            with dpg.theme_component(dpg.mvAll):
+                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 14, 14, category=dpg.mvThemeCat_Core)
+
         with dpg.window(tag="Main"):
             dpg.bind_item_theme("Main", "theme_no_padding")
 
@@ -3589,82 +3851,38 @@ class MotorBusterNativeApp:
             except Exception as e:
                 print(f"Failed to load icon texture: {e}")
 
-            # Custom Header (Single Bar + Right Controls Box)
-            with dpg.child_window(tag="title_bar", width=-1, height=36, border=True, no_scrollbar=True, no_scroll_with_mouse=True, menubar=True):
-                with dpg.menu_bar():
-                    dpg.add_spacer(width=8)
+            # Menu Bar (native title bar is provided by Windows)
+            with dpg.menu_bar():
+                with dpg.menu(label="File", tag="menu_file"):
+                    dpg.add_menu_item(label="Save Project", shortcut="(Ctrl+S)", callback=lambda: dpg.show_item("dlg_save"))
+                    dpg.add_menu_item(label="Open Project", shortcut="(Ctrl+O)", callback=lambda: dpg.show_item("dlg_load"))
+                    dpg.add_separator()
+                    dpg.add_menu_item(label="Exit", callback=lambda: dpg.stop_dearpygui())
 
-                    if texture_loaded:
-                        dpg.add_image("icon_texture", width=28, height=28)
+                with dpg.menu(label="View", tag="menu_view"):
+                    dpg.add_menu_item(label="Show Redlines", check=True, default_value=self.show_redlines, callback=self.toggle_redlines)
+                    dpg.add_menu_item(label="Wheel Graph", check=True, default_value=self._wheel_graph_visible, callback=self._on_wheel_graph_checkbox)
+                    dpg.add_menu_item(label="Mouse Status", check=True, tag="menu_mouse_status", default_value=self._mouse_status_visible, callback=self._on_mouse_status_checkbox)
 
-                    dpg.add_spacer(width=5)
-                    dpg.add_text("MotorBuster", color=(200, 200, 200))
-                    dpg.add_spacer(width=20)
+                with dpg.menu(label="About", tag="menu_about"):
+                    dpg.add_menu_item(label="About MotorBuster", callback=lambda: dpg.configure_item("win_about", show=True))
 
-                    with dpg.menu(label="File", tag="menu_file"):
-                        dpg.add_menu_item(label="Save Project", shortcut="(Ctrl+S)", callback=lambda: dpg.show_item("dlg_save"))
-                        dpg.add_menu_item(label="Open Project", shortcut="(Ctrl+O)", callback=lambda: dpg.show_item("dlg_load"))
-                        dpg.add_separator()
-                        dpg.add_menu_item(label="Exit", callback=lambda: dpg.stop_dearpygui())
+                dpg.bind_item_theme("menu_file", "theme_menu_popup")
+                dpg.bind_item_theme("menu_view", "theme_menu_popup")
+                dpg.bind_item_theme("menu_about", "theme_menu_popup")
 
-                    with dpg.menu(label="View", tag="menu_view"):
-                        dpg.add_menu_item(label="Show Redlines", check=True, default_value=self.show_redlines, callback=self.toggle_redlines)
-                        dpg.add_menu_item(label="Wheel Graph", check=True, default_value=self._wheel_graph_visible, callback=self._on_wheel_graph_checkbox)
-                        dpg.add_menu_item(label="Mouse Status", check=True, tag="menu_mouse_status", default_value=self._mouse_status_visible, callback=self._on_mouse_status_checkbox)
+                dpg.add_spacer(width=10)
+                dpg.add_combo(tag="device_combo", width=220, callback=self.on_device_selected)
+                dpg.add_button(label="Scan", callback=self.scan_devices)
+                dpg.add_button(label="Connect", callback=self.connect_callback)
+                dpg.add_text("Status: Disconnected", tag="status_text", color=(255, 100, 100))
+                
+                dpg.add_spacer(width=15)
+                dpg.add_text("Rate:", color=(180, 180, 180))
+                dpg.add_input_int(tag="poll_rate_input", width=50, default_value=500, min_value=10, max_value=1000, min_clamped=True, max_clamped=True, step=0, step_fast=0, callback=self._on_poll_rate_changed)
+                dpg.add_text("Hz", color=(180, 180, 180))
 
-                    with dpg.menu(label="Theme", tag="menu_theme"):
-                        dpg.add_menu_item(label="Classic", check=True, tag="menu_theme_Classic", callback=lambda: self.apply_theme("Classic"))
-                        dpg.add_menu_item(label="Dark Mode", check=True, tag="menu_theme_Dark Mode", callback=lambda: self.apply_theme("Dark Mode"))
-                        dpg.add_menu_item(label="Retro", check=True, tag="menu_theme_Retro", callback=lambda: self.apply_theme("Retro"))
-
-                    with dpg.menu(label="Backend", tag="menu_backend"):
-                        dpg.add_menu_item(label="DirectInput", check=True, tag="menu_backend_di",
-                                          default_value=True,
-                                          callback=lambda: self._set_backend_mode("directinput"))
-
-                    with dpg.menu(label="Diagnose", tag="menu_diagnose"):
-                        dpg.add_menu_item(label="HW Capability Mode...", callback=self.start_ffb_probe)
-                        dpg.add_menu_item(label="Quick HW Periodic Test", callback=self.run_diag_test)
-                        dpg.add_menu_item(label="Export Capability Report", callback=lambda: engine.diag_export_report("motorbuster_ffb_report.txt"))
-                        dpg.add_separator()
-                        dpg.add_menu_item(label="Freeze Test Mode", check=True, tag="menu_freeze_test",
-                                         default_value=self.freeze_test_active,
-                                         callback=lambda s, v: setattr(self, 'freeze_test_active', v))
-
-                    with dpg.menu(label="About", tag="menu_about"):
-                        dpg.add_menu_item(label="About MotorBuster", callback=lambda: dpg.configure_item("win_about", show=True))
-
-                    dpg.bind_item_theme("menu_file", "theme_menu_popup")
-                    dpg.bind_item_theme("menu_view", "theme_menu_popup")
-                    dpg.bind_item_theme("menu_theme", "theme_menu_popup")
-                    dpg.bind_item_theme("menu_backend", "theme_menu_popup")
-                    dpg.bind_item_theme("menu_diagnose", "theme_menu_popup")
-                    dpg.bind_item_theme("menu_about", "theme_menu_popup")
-
-                    dpg.add_spacer(width=10)
-                    dpg.add_combo(tag="device_combo", width=280, callback=self.on_device_selected)
-                    dpg.add_button(label="Scan", callback=self.scan_devices)
-                    dpg.add_button(label="Connect", callback=self.connect_callback)
-                    dpg.add_text("Status: Disconnected", tag="status_text", color=(255, 100, 100))
-                    dpg.add_spacer(width=15)
-                    dpg.add_text("Rate:", color=(180, 180, 180))
-                    dpg.add_input_int(tag="poll_rate_input", width=50, default_value=500, min_value=10, max_value=1000, min_clamped=True, max_clamped=True, step=0, step_fast=0, callback=self._on_poll_rate_changed)
-                    dpg.add_text("Hz", color=(180, 180, 180))
-
-            with dpg.child_window(tag="title_controls_box", pos=[0, 0], width=96, height=30,
-                                   border=True, no_scrollbar=True, no_scroll_with_mouse=True):
-                with dpg.group(horizontal=True):
-                    b_min = dpg.add_button(label="—", width=26, height=24, callback=lambda: dpg.minimize_viewport())
-                    b_max = dpg.add_button(label="□", width=26, height=24, callback=self.toggle_maximize)
-                    b_close = dpg.add_button(label="×", width=26, height=24, callback=lambda: dpg.stop_dearpygui())
-
-            dpg.bind_item_theme(b_min, "theme_title_controls")
-            dpg.bind_item_theme(b_max, "theme_title_controls")
-            dpg.bind_item_theme(b_close, "theme_title_controls")
-            dpg.bind_item_theme("device_combo", "theme_title_combo")
-
-
-            dpg.add_separator()  
+            dpg.add_separator()
             # Spacing below title bar - Reduced to 0/minimal as requested
             # Content will sit flush against separator
             
@@ -3838,10 +4056,66 @@ class MotorBusterNativeApp:
                 with dpg.group():
                     # Inspector Section (Top Half)
                     with dpg.child_window(tag="panel_inspector", height=450):
+                        dpg.bind_item_theme("panel_inspector", "theme_inspector_panel")
                         # We use a Tab Bar here to host the single Live Inspector tab
                         # This keeps the look consistent and clean
                         with dpg.tab_bar(tag="inspector_tab_bar"):
-                            pass
+                            # COM Port tab (first - alphabetical)
+                            with dpg.tab(label="COM", tag="tab_com"):
+                                dpg.add_spacer(height=4)
+                                dpg.add_text("Serial Port", color=(200, 200, 255))
+                                dpg.add_separator()
+                                dpg.add_spacer(height=4)
+                                with dpg.group(horizontal=True):
+                                    dpg.add_combo(tag="serial_port_combo", width=220, callback=self._on_serial_port_selected)
+                                    dpg.add_button(label="Scan", callback=self._scan_serial_ports)
+                                dpg.add_spacer(height=3)
+                                with dpg.group(horizontal=True):
+                                    dpg.add_combo(tag="serial_baud_combo", width=100, default_value="115200", items=["9600","19200","38400","57600","115200","230400","460800","921600"], callback=self._on_serial_baud_changed)
+                                    dpg.add_button(label="Connect", tag="btn_serial_connect", callback=self._connect_serial)
+                                dpg.add_spacer(height=6)
+                                dpg.add_text("COM: Offline", tag="txt_serial_status", color=(100, 100, 100))
+                                dpg.add_spacer(height=5)
+                                dpg.add_text("Response Timing:", color=(180, 180, 200))
+                                dpg.add_text("Δ = --- ms", tag="txt_serial_timing", color=(200, 200, 200))
+
+                            # Inspector tab (second - loads by default)
+                            # (built dynamically below via create_floating_inspector)
+
+                            # Sweep tab (third - alphabetical)
+                            with dpg.tab(label="Sweep", tag="tab_sweep"):
+                                dpg.add_text("Frequency Range", color=(200, 200, 255))
+                                dpg.add_separator()
+                                dpg.add_input_float(label="Min (Hz)", tag="sweep_freq_min", default_value=10.0, step=0)
+                                dpg.add_input_float(label="Max (Hz)", tag="sweep_freq_max", default_value=500.0, step=0)
+                                dpg.add_input_int(label="Points", tag="sweep_num_freq", default_value=20, min_value=2, max_value=200)
+                                dpg.add_separator()
+                                dpg.add_text("Signal Configuration", color=(180, 180, 200))
+                                dpg.add_separator()
+                                with dpg.group(horizontal=True):
+                                    dpg.add_input_float(label="Max Torque", tag="sweep_max_torque", default_value=25.0, width=200, min_value=0.1, max_value=100.0, step=0)
+                                    dpg.add_text("(auto)", color=(140, 140, 140))
+                                with dpg.group(horizontal=True):
+                                    dpg.add_slider_int(label="Torque", tag="sweep_torque_pct", default_value=10, min_value=0, max_value=100, width=200, callback=self._on_sweep_torque_slider)
+                                    dpg.add_text("10% (2.5 Nm)", tag="txt_sweep_torque_readout", color=(180, 220, 180))
+                                dpg.add_input_int(label="Settle periods", tag="sweep_settling", default_value=2, min_value=0, max_value=20)
+                                dpg.add_input_int(label="Num periods", tag="sweep_periods", default_value=5, min_value=1, max_value=50)
+                                dpg.add_input_int(label="Ramp periods", tag="sweep_ramp", default_value=1, min_value=0, max_value=10)
+                                dpg.add_spacer(height=8)
+                                dpg.add_separator()
+                                dpg.add_spacer(height=4)
+                                with dpg.group(horizontal=True):
+                                    dpg.add_text("Frequencies:", color=(200, 200, 255))
+                                    dpg.add_button(label="Preview", width=80, callback=self._sweep_preview_freqs)
+                                dpg.add_text("", tag="txt_sweep_freqs", wrap=350, color=(180, 220, 180))
+                                dpg.add_spacer(height=4)
+                                dpg.add_progress_bar(tag="sweep_progress", width=-1, default_value=0.0)
+                                dpg.add_spacer(height=3)
+                                dpg.add_text("Status: Ready", tag="txt_sweep_status", color=(200, 200, 200))
+                                dpg.add_spacer(height=6)
+                                dpg.add_button(label="Run", tag="btn_sweep_run", callback=self._sweep_run)
+                                dpg.add_button(label="Stop", tag="btn_sweep_cancel", enabled=False, callback=self._sweep_cancel)
+                                dpg.add_button(label="Export", tag="btn_sweep_export", enabled=False, callback=self._sweep_export)
             
                     # Log Section (Bottom Half)
                     with dpg.child_window(tag="panel_log", height=-1):
@@ -3861,278 +4135,6 @@ class MotorBusterNativeApp:
 
     def toggle_redlines(self, sender, app_data, user_data=None):
         self.show_redlines = bool(app_data)
-
-    def _on_title_menu_button(self, sender, app_data, user_data):
-        popup_tag = user_data
-        all_popups = [
-            "popup_file_menu",
-            "popup_view_menu",
-            "popup_theme_menu",
-            "popup_diag_menu",
-            "popup_about_menu",
-        ]
-        for tag in all_popups:
-            if tag != popup_tag and dpg.does_item_exist(tag):
-                dpg.configure_item(tag, show=False)
-        if not dpg.does_item_exist(popup_tag):
-            return
-        try:
-            min_x, min_y = dpg.get_item_rect_min(sender)
-            max_x, max_y = dpg.get_item_rect_max(sender)
-            dpg.set_item_pos(popup_tag, (min_x, max_y))
-            dpg.configure_item(popup_tag, show=True)
-            dpg.focus_item(popup_tag)
-        except Exception:
-            return
-
-    
-    # --- Custom Title Bar Logic ---
-    def _render_custom_title_bar(self):
-        with dpg.group(horizontal=True, tag="custom_title_bar"):
-            # Icon
-            # dpg.add_image("app_icon", width=20, height=20) # Need to load image texture first if we want this
-            dpg.add_button(label="MotorBuster", width=100, tag="title_drag_area", callback=None) # Placeholder/Title - DRAGGABLE
-            
-            # Drag Area (Spacer)
-            # We use a button or specific item to catch drag? 
-            # Actually, we can just check if mouse is over the title bar group and is dragging.
-            dpg.add_spacer(width=20, tag="title_bar_icon_spacer")
-            
-            # Application Menu (File, View, etc) integrated into Title Bar? 
-            # Or just below it? Let's put it back in the main window for now, 
-            # but usually borderless apps have the menu inside the bar.
-            # To simulate Menu Bar in a Group:
-            with dpg.menu_bar():
-                 with dpg.menu(label="File", tag="title_menu_file"):
-                    dpg.add_menu_item(label="Save Project", shortcut="(Ctrl+S)", callback=lambda: dpg.show_item("dlg_save"))
-                    dpg.add_menu_item(label="Open Project", shortcut="(Ctrl+O)", callback=lambda: dpg.show_item("dlg_load"))
-                    dpg.add_separator()
-                    dpg.add_menu_item(label="Exit", callback=lambda: dpg.stop_dearpygui())
-                 with dpg.menu(label="View", tag="title_menu_view"):
-
-                    dpg.add_menu_item(label="Show Redlines", check=True, default_value=self.show_redlines, callback=self.toggle_redlines)
-                    dpg.add_menu_item(label="Wheel Graph", check=True, default_value=self._wheel_graph_visible, callback=self._on_wheel_graph_checkbox)
-                    dpg.add_menu_item(label="Force Graph", check=True, default_value=self._force_graph_visible, tag="menu_force_graph", callback=self._on_force_graph_checkbox)
-                    dpg.add_menu_item(label="Auto Scale Graph", check=True, default_value=self.wheel_graph_auto_scale, callback=self._on_wheel_graph_auto_scale)
-                    dpg.add_menu_item(label="Mouse Status", check=True, default_value=self._mouse_status_visible, callback=self._on_mouse_status_checkbox)
-                 # Re-add Device Controls to Menu Bar area
-                 dpg.add_spacer(width=20)
-                 dpg.add_combo(tag="device_combo", width=200, callback=self.on_device_selected)
-                 dpg.add_button(label="Scan", callback=self.scan_devices)
-                 dpg.add_button(label="Connect", callback=self.connect_callback)
-                 dpg.add_text("Status: Disconnected", tag="status_text", color=(255, 100, 100))
-
-            # Spacer to push window controls to the right
-            # This is tricky in DPG as width=-1 might not work in group horizontal
-            # We can calculate dynamic width or just use a large spacer for now/
-            # Better: DPG 'layout' is limited. We might need to rely on the window width.
-            avail_w = dpg.get_item_width("Main") 
-            # This is hard to get perfectly right without a resize callback calculating width.
-            # Fallback: Just putting them on the right might require a separate group with alignment, but DPG Main window is root.
-            
-            dpg.add_spacer(width=50) # Just a bit of space
-
-            # Window Controls
-            dpg.add_button(label="_", tag="title_min", width=30, callback=lambda: dpg.minimize_viewport())
-            dpg.add_button(label="[ ]", tag="title_max", width=30, callback=self.toggle_maximize)
-            dpg.add_button(label="X", tag="title_close", width=30, callback=lambda: dpg.stop_dearpygui())
-
-    def toggle_maximize(self):
-        # Native Maximize/Restore to ensure sync with OS state
-        try:
-            import ctypes
-            hwnd = ctypes.windll.user32.FindWindowW(None, "MotorBuster")
-            if hwnd:
-                if ctypes.windll.user32.IsZoomed(hwnd):
-                    ctypes.windll.user32.ShowWindow(hwnd, 9) # SW_RESTORE = 9
-                else:
-                    ctypes.windll.user32.ShowWindow(hwnd, 3) # SW_MAXIMIZE = 3
-        except Exception as e:
-            print(f"Maximize failed: {e}")
-
-    def _enable_resize(self):
-        # Enable resizing for borderless window
-        try:
-            import ctypes
-            from ctypes import wintypes
-            GWL_STYLE = -16
-            WS_THICKFRAME = 0x00040000
-            WS_CAPTION = 0x00C00000
-            
-            hwnd = ctypes.windll.user32.FindWindowW(None, "MotorBuster")
-            if hwnd:
-                style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
-                # Ensure WS_THICKFRAME is on, WS_CAPTION is off (already off by decorated=False usually)
-                style |= WS_THICKFRAME
-                style &= ~WS_CAPTION # Ensure no caption
-                # Apply style
-                ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
-                
-                # Force frame update using SetWindowPos
-                # SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED (0x0020)
-                ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 
-                                                  0x0002 | 0x0001 | 0x0004 | 0x0020)
-        except Exception as e:
-            print(f"Resize enable failed: {e}")
-
-    def _update_title_bar_layout(self):
-        """Calculates spacer width to push window controls to right edge."""
-        try:
-            return
-        except: pass
-
-    def _update_resize_cursor_and_drag(self):
-         # Short & Robust Implementation: Visuals + Actions
-         # OPTIMIZED: Caches cursors, avoids frequent API calls, prevents DPG conflict.
-         
-         if not hasattr(self, 'last_cursor'): self.last_cursor = 0
-         if not hasattr(self, '_drag_initiated'): self._drag_initiated = False
-         if not hasattr(self, '_hwnd'):
-             import ctypes
-             self._hwnd = ctypes.windll.user32.FindWindowW(None, "MotorBuster")
-             self._cursor_cache = {
-                 0: ctypes.windll.user32.LoadCursorW(0, 32512),
-                 32644: ctypes.windll.user32.LoadCursorW(0, 32644),
-                 32645: ctypes.windll.user32.LoadCursorW(0, 32645),
-                 32642: ctypes.windll.user32.LoadCursorW(0, 32642),
-                 32643: ctypes.windll.user32.LoadCursorW(0, 32643),
-             }
-         
-         import ctypes
-         if ctypes.windll.user32.GetForegroundWindow() != self._hwnd:
-             self._drag_fps_override_hz = 0
-             return
-
-         import win32api
-         from ctypes import wintypes
-         
-         # Use screen coordinates to match Windows native resize zone
-         cursor_screen = win32api.GetCursorPos()
-         rect = wintypes.RECT()
-         ctypes.windll.user32.GetWindowRect(self._hwnd, ctypes.byref(rect))
-         
-         # Calculate mouse position relative to window (including extended frame)
-         mx = cursor_screen[0] - rect.left
-         my = cursor_screen[1] - rect.top
-         vw = rect.right - rect.left
-         vh = rect.bottom - rect.top
-         
-         BORDER = 6  # Larger zone for resize cursor visibility
-
-         new_cursor_id = 0
-         hit_code = 0
-         
-         # Check if cursor is within or just outside window bounds (extended frame area)
-         EXTENDED = 6  # Extra pixels outside window for extended frame
-         if -EXTENDED <= mx <= vw + EXTENDED and -EXTENDED <= my <= vh + EXTENDED:
-             if mx < BORDER:
-                 if my < BORDER: hit_code = 13  # HTTOPLEFT
-                 elif my > vh - BORDER: hit_code = 16  # HTBOTTOMLEFT
-                 else: hit_code = 10  # HTLEFT
-             elif mx > vw - BORDER:
-                 if my < BORDER: hit_code = 14  # HTTOPRIGHT
-                 elif my > vh - BORDER: hit_code = 17  # HTBOTTOMRIGHT
-                 else: hit_code = 11  # HTRIGHT
-             elif my < BORDER: hit_code = 12  # HTTOP
-             elif my > vh - BORDER: hit_code = 15  # HTBOTTOM
-         
-         # Note: Moved drag/key dependency here to support cursor syncing
-         import win32api
-         mouse_down = win32api.GetKeyState(0x01) < 0
-         
-         # Track drag start position to implement drag threshold
-         if not hasattr(self, '_drag_start_pos'):
-             self._drag_start_pos = None
-         if not hasattr(self, '_window_drag_offset'):
-             self._window_drag_offset = None
-
-         # Track if we're hovering over an edge with mouse up (ready for resize)
-         if not hasattr(self, '_edge_hover_ready'):
-             self._edge_hover_ready = False
-         
-         # Update edge hover ready state: set to True if hovering edge with mouse up
-         if hit_code != 0 and not mouse_down:
-             self._edge_hover_ready = True
-         elif hit_code == 0:
-             # Not on edge anymore, reset ready state
-             self._edge_hover_ready = False
-
-         if hit_code != 0:
-             c_map = {10:32644, 11:32644, 12:32645, 13:32642, 14:32643, 15:32645, 16:32643, 17:32642}
-             new_cursor_id = c_map.get(hit_code, 0)
-         
-         if new_cursor_id != 0 and self._edge_hover_ready:
-              # Always set cursor to override DPG reset
-              ctypes.windll.user32.SetCursor(self._cursor_cache.get(new_cursor_id))
-              self.last_cursor = new_cursor_id
-         elif self.last_cursor != 0:
-             ctypes.windll.user32.SetCursor(self._cursor_cache.get(0))
-             self.last_cursor = 0
-         
-         if mouse_down:
-             if not self._drag_initiated:
-                 if hit_code != 0 and self._edge_hover_ready:
-                     # Resize ONLY - but only if we were hovering before mouse press
-                     ctypes.windll.user32.ReleaseCapture()
-                     ctypes.windll.user32.SendMessageW(self._hwnd, 0xA1, hit_code, 0)
-                     self._drag_initiated = True
-                 elif hit_code == 0 and my < 40 and mx < vw - 150:
-                     # Title Bar Drag Zone (Manual, non-blocking)
-                     # Exclude right-side buttons to prevent hijacking clicks
-                     if self._drag_start_pos is None:
-                         # First frame in drag zone - record position
-                         self._drag_start_pos = (mx, my)
-                     else:
-                         # Check if mouse has moved enough to trigger drag
-                         dx = abs(mx - self._drag_start_pos[0])
-                         dy = abs(my - self._drag_start_pos[1])
-                         drag_threshold = 5  # pixels
-                         
-                         if dx > drag_threshold or dy > drag_threshold:
-                             # Mouse moved enough - start custom dragging (non-blocking)
-                             if self._window_drag_offset is None:
-                                 import win32api
-                                 cursor_screen = win32api.GetCursorPos()
-                                 # Get window position
-                                 rect = ctypes.wintypes.RECT()
-                                 ctypes.windll.user32.GetWindowRect(self._hwnd, ctypes.byref(rect))
-                                 # Calculate offset from cursor to window top-left
-                                 self._window_drag_offset = (cursor_screen[0] - rect.left, cursor_screen[1] - rect.top)
-                             self._drag_initiated = True
-                 else:
-                     # Mouse moved outside drag zone
-                     self._drag_start_pos = None
-                     self._window_drag_offset = None
-             elif self._window_drag_offset is not None:
-                 # Continue custom drag - move window to follow cursor
-                 try:
-                     import win32api
-                     cursor_screen = win32api.GetCursorPos()
-                     new_x = cursor_screen[0] - self._window_drag_offset[0]
-                     new_y = cursor_screen[1] - self._window_drag_offset[1]
-                     # SWP_NOSIZE | SWP_NOZORDER = 0x0001 | 0x0004 = 0x0005
-                     ctypes.windll.user32.SetWindowPos(self._hwnd, 0, new_x, new_y, 0, 0, 0x0005)
-                 except: pass
-         else:
-             # Mouse released
-             self._drag_start_pos = None
-             self._window_drag_offset = None
-             # Restore focus when drag completes
-             if self._drag_initiated:
-                 # Use multiple methods to ensure focus is restored
-                 try:
-                     # Bring window to top of Z-order
-                     ctypes.windll.user32.BringWindowToTop(self._hwnd)
-                     # Set as active window
-                     ctypes.windll.user32.SetActiveWindow(self._hwnd)
-                     # Set foreground
-                     ctypes.windll.user32.SetForegroundWindow(self._hwnd)
-                     # Simulate a left mouse button up event to clear any stuck state
-                     ctypes.windll.user32.SendMessageW(self._hwnd, 0x0202, 0, 0)  # WM_LBUTTONUP
-                 except: pass
-             self._drag_initiated = False
-
-         self._drag_fps_override_hz = self.DRAG_ACTIVE_FPS if self._window_drag_offset is not None else 0
 
     def get_settings_path(self):
         import os
@@ -4164,6 +4166,7 @@ class MotorBusterNativeApp:
                     self._wheel_graph_visible = settings.get("wheel_graph_visible", True)
                     self._mouse_status_visible = settings.get("mouse_status_visible", True)
                     self.wheel_graph_gain = settings.get("wheel_graph_gain", 1.0)
+                    self._device_torque_overrides = settings.get("device_torque_overrides", {})
                     
                     # Validate Coordinates (Fix for invisible window issue)
                     if self.window_x < -10000 or self.window_y < -10000:
@@ -4236,7 +4239,7 @@ class MotorBusterNativeApp:
                             x_pos=self.window_x, y_pos=self.window_y,
                             vsync=False, 
                             small_icon=icon_path, large_icon=icon_path, 
-                            decorated=False) 
+                            decorated=True) 
                             
         dpg.setup_dearpygui()
         dpg.show_viewport()
@@ -4256,8 +4259,8 @@ class MotorBusterNativeApp:
 
         dpg.set_primary_window("Main", True)
         
-        # Enable resizing logic (Native Style)
-        self._enable_resize()
+        # Native title bar already provides resizing — skip borderless resize hack
+        # self._enable_resize()
 
         self.scan_devices()
 
@@ -4344,9 +4347,6 @@ class MotorBusterNativeApp:
                 
                 # --- 3. Effects & Input Loop (High Priority) ---
                 if should_run_effects:
-                    # Always Update Drag State
-                    self._update_resize_cursor_and_drag()
-                    
                     try:
                         self.update_loop()
                     except Exception as e:
@@ -4364,22 +4364,6 @@ class MotorBusterNativeApp:
 
                 # --- 4. UI Loop (60Hz) ---
                 if should_run_ui:
-                    # Update Visual Elements
-                    self._update_title_bar_layout()
-                    if dpg.does_item_exist("title_controls_box") and dpg.does_item_exist("title_bar"):
-                        try:
-                            bar_pos_x, bar_pos_y = dpg.get_item_pos("title_bar")
-                            bar_w, bar_h = dpg.get_item_rect_size("title_bar")
-                            box_w = dpg.get_item_rect_size("title_controls_box")[0]
-                            box_h = max(24, int(bar_h) - 2)
-                            pos_x = max(0, int(bar_pos_x + bar_w - box_w - 4))
-                            pos_y = max(0, int(bar_pos_y + bar_h - box_h - 1))
-                            dpg.configure_item("title_controls_box", height=box_h)
-                            dpg.set_item_pos("title_controls_box", (pos_x, pos_y))
-                            dpg.configure_item("title_controls_box", show=True)
-                            dpg.bring_item_to_front("title_controls_box")
-                        except Exception:
-                            pass
                     dpg.set_value("time_display", f"{self.sequencer.current_time:.2f}s")
                     
                     # Only re-render timeline if it's visible (optimization)
