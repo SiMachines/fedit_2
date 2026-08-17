@@ -482,6 +482,10 @@ class MotorBusterNativeApp:
         self.serial_baud = 115200
         self.serial_connected = False
         self.serial_timing_data = {}
+        # Manual command selector state (Cmd tab)
+        self._cmd_expects_response = False
+        self._cmd_sent_time = 0.0
+        self._cmd_timeout = 5.0
         
         # Diagnostic state (still referenced by UI)
         self.freeze_test_active = False
@@ -1218,14 +1222,88 @@ class MotorBusterNativeApp:
     def _on_serial_response(self, data: dict):
         """Callback when serial response is received from MCU."""
         self.serial_timing_data = data
-        delta_ms = data.get("delta_ms", 0)
-        t1 = data.get("t1", 0)
-        t2 = data.get("t2", 0)
-        if dpg.does_item_exist("txt_serial_timing"):
-            color = (100, 255, 100) if delta_ms < 1 else (255, 255, 100) if delta_ms < 5 else (255, 100, 100)
-            dpg.set_value("txt_serial_timing", f"Δ = {delta_ms:.3f} ms | T1={t1} T2={t2}")
-            dpg.configure_item("txt_serial_timing", color=color)
-        self.log(f"Serial Response: Δ={delta_ms:.3f}ms")
+        mag_db = data.get('mag_db', 0.0)
+        phase_deg = data.get('phase_deg', 0.0)
+        if dpg.does_item_exist('txt_serial_timing'):
+            dpg.set_value('txt_serial_timing', f'Mag = {mag_db:.2f} dB | Phase = {phase_deg:.2f}°')
+            dpg.configure_item('txt_serial_timing', color=(100, 255, 100))
+        self.log(f'Serial Response: Mag={mag_db:.2f} dB, Phase={phase_deg:.2f}°')
+
+        # Also surface the response in the Cmd tab if waiting on a manual command
+        if getattr(self, '_cmd_expects_response', False) and dpg.does_item_exist('txt_cmd_status'):
+            dpg.set_value('txt_cmd_status', f'Response: cmd=0x{data.get("cmd", 0):02X} | Mag = {mag_db:.2f} dB | Phase = {phase_deg:.2f}°')
+            self._cmd_expects_response = False
+
+    # --- Manual Command Selector (Cmd tab) ---
+    def _on_cmd_selector_change(self, sender, app_data):
+        # Enable/disable parameter fields based on the selected command.
+        key = (app_data or '').split(' ')[0].lower()
+        needs_params = key in ('sine', 'constant')
+        for tag in ('cmd_freq', 'cmd_mag_pct', 'cmd_max_torque', 'cmd_settle', 'cmd_ramp'):
+            if not dpg.does_item_exist(tag):
+                continue
+            if needs_params:
+                dpg.enable_item(tag)
+            else:
+                dpg.disable_item(tag)
+
+    def _cmd_send(self, sender=None, app_data=None):
+        # Send the selected firmware command from the Cmd tab.
+        if not self.serial_connected:
+            dpg.set_value('txt_cmd_status', 'Error: Serial not connected')
+            return
+        if sweep_engine.is_running:
+            dpg.set_value('txt_cmd_status', 'Error: A sweep is running - press Stop first')
+            return
+
+        sel = dpg.get_value('cmd_selector') or ''
+        key = sel.split(' ')[0].lower()
+        cmd_hex = {'sine': '0x01', 'constant': '0x06', 'center': '0x08',
+                   'scale': '0x09', 'selftest': '0xFE', 'stop': '0xFF'}.get(key, '0x??')
+        expects_response = key in ('sine', 'constant', 'selftest')
+
+        freq = max(1.0, dpg.get_value('cmd_freq'))
+        mag_pct = dpg.get_value('cmd_mag_pct')
+        settle = dpg.get_value('cmd_settle')
+        ramp = dpg.get_value('cmd_ramp')
+        max_torque = dpg.get_value('cmd_max_torque')
+        mag = int(32767 * mag_pct / 100.0)
+
+        if key == 'center':
+            ok = serial_manager.send_center()
+        elif key == 'scale':
+            ok = serial_manager.send_scale()
+        elif key == 'stop':
+            ok = serial_manager.send_stop()
+        elif key == 'selftest':
+            ok = serial_manager.send_selftest()
+        else:  # sine / constant
+            ok = serial_manager.send_effect(key, freq, mag, settle, ramp, max_torque)
+
+        if not ok:
+            dpg.set_value('txt_cmd_status', 'Send failed (not connected?)')
+            return
+
+        if expects_response:
+            if key in ('sine', 'constant'):
+                self._cmd_timeout = (1.0 / freq) * (settle + ramp + 8) + 1.0
+            else:  # selftest
+                self._cmd_timeout = 5.0
+            self._cmd_expects_response = True
+            self._cmd_sent_time = time.time()
+            dpg.set_value('txt_cmd_status', f'Sent {key.upper()} ({cmd_hex}) - waiting for response...')
+        else:
+            self._cmd_expects_response = False
+            dpg.set_value('txt_cmd_status', f'Sent {key.upper()} ({cmd_hex}) - no response expected')
+
+    def _cmd_send_stop(self, sender=None, app_data=None):
+        # Quick STOP button in the Cmd tab.
+        if not self.serial_connected:
+            dpg.set_value('txt_cmd_status', 'Error: Serial not connected')
+            return
+        ok = serial_manager.send_stop()
+        self._cmd_expects_response = False
+        dpg.set_value('txt_cmd_status', 'Sent STOP (0xFF)' if ok else 'Send failed')
 
     # --- Sweep Panel Methods ---
     def _on_sweep_torque_slider(self, sender, app_data):
@@ -1300,13 +1378,10 @@ class MotorBusterNativeApp:
 
             with dpg.group(horizontal=True):
                 dpg.add_text("Settling periods:")
-                dpg.add_input_int(tag="sweep_settling", default_value=2, width=80, min_value=0, max_value=20)
-                dpg.add_spacer(width=15)
-                dpg.add_text("Num periods:")
-                dpg.add_input_int(tag="sweep_periods", default_value=5, width=80, min_value=1, max_value=50)
+                dpg.add_input_int(tag="sweep_settling", default_value=2, width=80, min_value=0, max_value=4)
                 dpg.add_spacer(width=15)
                 dpg.add_text("Ramp periods:")
-                dpg.add_input_int(tag="sweep_ramp", default_value=1, width=80, min_value=0, max_value=10)
+                dpg.add_input_int(tag="sweep_ramp", default_value=1, width=80, min_value=0, max_value=1)
 
             dpg.add_separator()
 
@@ -1373,7 +1448,6 @@ class MotorBusterNativeApp:
             config.max_torque_nm = dpg.get_value("sweep_max_torque")
 
             config.settling_periods = dpg.get_value("sweep_settling")
-            config.num_periods = dpg.get_value("sweep_periods")
             config.ramp_periods = dpg.get_value("sweep_ramp")
             config.perform_filtering = True  # Always enabled
             
@@ -1418,16 +1492,14 @@ class MotorBusterNativeApp:
         """Export sweep results."""
         sweep_engine.export_results("motorbuster_sweep_results.json")
 
-    def _sweep_engine_send_effect(self, effect_type: str, freq_hz: float, magnitude: int, duration_ms: int,
-                                  max_torque_nm: float = 25.0,
-                                  settle_periods: int = 2,
-                                  num_periods: int = 5,
-                                  ramp_periods: int = 1) -> Optional[int]:
+    def _sweep_engine_send_effect(self, effect_type: str, freq_hz: float, magnitude: int,
+                                  settle_periods: int = 2, ramp_periods: int = 1,
+                                  max_torque_nm: float = 25.0) -> bool:
         """Called by sweep engine to send an effect over serial."""
         if self.serial_connected:
-            return serial_manager.send_effect(effect_type, freq_hz, magnitude, duration_ms,
-                                              max_torque_nm, settle_periods, num_periods, ramp_periods)
-        return None
+            return serial_manager.send_effect(effect_type, freq_hz, magnitude,
+                                              settle_periods, ramp_periods, max_torque_nm)
+        return False
 
     def _sweep_engine_send_stop(self):
         """Called by sweep engine to send stop."""
@@ -2217,6 +2289,13 @@ class MotorBusterNativeApp:
              self._draw_resize_cursor(rel_x, rel_y)
         
         self._set_system_cursor_visible(not should_hide_system)
+
+        # Manual command response timeout (Cmd tab)
+        if getattr(self, '_cmd_expects_response', False):
+            if self._cmd_timeout < time.time() - self._cmd_sent_time:
+                self._cmd_expects_response = False
+                if dpg.does_item_exist('txt_cmd_status'):
+                    dpg.set_value('txt_cmd_status', 'No response (timeout)')
 
 
 
@@ -4076,8 +4155,43 @@ class MotorBusterNativeApp:
                                 dpg.add_spacer(height=6)
                                 dpg.add_text("COM: Offline", tag="txt_serial_status", color=(100, 100, 100))
                                 dpg.add_spacer(height=5)
-                                dpg.add_text("Response Timing:", color=(180, 180, 200))
-                                dpg.add_text("Δ = --- ms", tag="txt_serial_timing", color=(200, 200, 200))
+                                dpg.add_text("Bode Response:", color=(180, 180, 200))
+                                dpg.add_text("Mag = --- dB | Phase = ---°", tag="txt_serial_timing", color=(200, 200, 200))
+
+                            # Cmd tab (command selector - manual firmware commands)
+                            with dpg.tab(label="Cmd", tag="tab_cmd"):
+                                dpg.add_spacer(height=4)
+                                dpg.add_text("Command Selector", color=(200, 200, 255))
+                                dpg.add_separator()
+                                dpg.add_spacer(height=4)
+                                dpg.add_combo(label="Command", tag="cmd_selector", width=200,
+                                              items=["SINE (0x01)", "CONSTANT (0x06)", "CENTER (0x08)",
+                                                     "SCALE (0x09)", "SELFTEST (0xFE)", "STOP (0xFF)"],
+                                              default_value="SINE (0x01)", callback=self._on_cmd_selector_change)
+                                dpg.add_spacer(height=4)
+                                dpg.add_input_float(label="Frequency (Hz)", tag="cmd_freq", default_value=20.0,
+                                                    min_value=1.0, max_value=10000.0, step=0, width=150)
+                                dpg.add_slider_int(label="Magnitude %", tag="cmd_mag_pct", default_value=10,
+                                                   min_value=0, max_value=100, width=200)
+                                with dpg.group(horizontal=True):
+                                    dpg.add_input_float(label="Max Torque (Nm)", tag="cmd_max_torque",
+                                                        default_value=25.0, min_value=0.1, max_value=100.0,
+                                                        step=0, width=110)
+                                    dpg.add_text("(manual)", color=(140, 140, 140))
+                                with dpg.group(horizontal=True):
+                                    dpg.add_input_int(label="Settle", tag="cmd_settle", default_value=2,
+                                                      min_value=0, max_value=4, width=70)
+                                    dpg.add_spacer(width=8)
+                                    dpg.add_input_int(label="Ramp", tag="cmd_ramp", default_value=1,
+                                                      min_value=0, max_value=1, width=70)
+                                dpg.add_spacer(height=8)
+                                dpg.add_separator()
+                                dpg.add_spacer(height=4)
+                                with dpg.group(horizontal=True):
+                                    dpg.add_button(label="Send", tag="btn_cmd_send", width=90, callback=self._cmd_send)
+                                    dpg.add_button(label="STOP", tag="btn_cmd_stop", width=80, callback=self._cmd_send_stop)
+                                dpg.add_spacer(height=6)
+                                dpg.add_text("Status: idle", tag="txt_cmd_status", wrap=350, color=(180, 220, 180))
 
                             # Inspector tab (second - loads by default)
                             # (built dynamically below via create_floating_inspector)
@@ -4098,9 +4212,8 @@ class MotorBusterNativeApp:
                                 with dpg.group(horizontal=True):
                                     dpg.add_slider_int(label="Torque", tag="sweep_torque_pct", default_value=10, min_value=0, max_value=100, width=200, callback=self._on_sweep_torque_slider)
                                     dpg.add_text("10% (2.5 Nm)", tag="txt_sweep_torque_readout", color=(180, 220, 180))
-                                dpg.add_input_int(label="Settle periods", tag="sweep_settling", default_value=2, min_value=0, max_value=20)
-                                dpg.add_input_int(label="Num periods", tag="sweep_periods", default_value=5, min_value=1, max_value=50)
-                                dpg.add_input_int(label="Ramp periods", tag="sweep_ramp", default_value=1, min_value=0, max_value=10)
+                                dpg.add_input_int(label="Settle periods", tag="sweep_settling", default_value=2, min_value=0, max_value=4)
+                                dpg.add_input_int(label="Ramp periods", tag="sweep_ramp", default_value=1, min_value=0, max_value=1)
                                 dpg.add_spacer(height=8)
                                 dpg.add_separator()
                                 dpg.add_spacer(height=4)
