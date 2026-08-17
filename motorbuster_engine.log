@@ -2247,3 +2247,11 @@
 2026-08-17 13:21:20,259 INFO:FFB_Engine:DirectInput backend ignores SDL device index; using first available DI device
 2026-08-17 13:21:20,431 INFO:FFB_Engine:DirectInput backend initialized via Unity DI for guid={8424D4D0-5664-11F0-8001-444553540000}
 2026-08-17 13:21:20,432 INFO:FFB_Engine:DirectInput backend active; SDL haptics disabled.
+2026-08-17 13:37:55,329 INFO:FFB_Engine:SDL3 custom events registered: {'EFFECT_START': 32768, 'EFFECT_STOP': 32769, 'POSITION_REQUEST': 32770}
+2026-08-17 13:37:55,533 INFO:FFB_Engine:Loaded DirectInput provider: unity_di (c:\Users\nishi\OneDrive\Desktop\MotorBuster\MotorBuster\DirectInputForceFeedback.dll)
+2026-08-17 13:37:55,689 INFO:FFB_Engine:DirectInput scan found 1 FFB-capable device(s) via Unity DI
+2026-08-17 13:37:55,689 INFO:FFB_Engine:Connecting to (DI mode): CONSPIT Ares [VID:0000 PID:0000]
+2026-08-17 13:37:55,752 INFO:FFB_Engine:Opened SDL input telemetry handle: joy_id=5, axes=8, gamepad=no
+2026-08-17 13:37:55,752 INFO:FFB_Engine:DirectInput backend ignores SDL device index; using first available DI device
+2026-08-17 13:37:55,920 INFO:FFB_Engine:DirectInput backend initialized via Unity DI for guid={8424D4D0-5664-11F0-8001-444553540000}
+2026-08-17 13:37:55,921 INFO:FFB_Engine:DirectInput backend active; SDL haptics disabled.
