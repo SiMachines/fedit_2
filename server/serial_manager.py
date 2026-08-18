@@ -8,6 +8,12 @@ from typing import Optional, Callable
 
 logger = logging.getLogger('Serial_Manager')
 
+
+def _hex(data: bytes) -> str:
+    '''Return a human-readable hex dump of bytes, e.g. 'AA 01 00 00 ...'.'''
+    return ' '.join(f'{b:02X}' for b in data)
+
+
 # Binary protocol constants
 START_BYTE = 0xAA
 RESPONSE_BYTE = 0xBB
@@ -90,9 +96,19 @@ def _parse_response(data: bytes) -> Optional[dict]:
         return None
 
     if data[0] != RESPONSE_BYTE:
+        logger.debug(f'Response ignored: first byte 0x{data[0]:02X} != 0x{RESPONSE_BYTE:02X} '
+                     f'(raw: {_hex(data)})')
         return None
 
-    cmd_echo, mag_db, phase_deg = struct.unpack('<BBff', data[:10])
+    try:
+        # NOTE: '<BBff' unpacks FOUR values (B, B, f, f) -> cmd_echo, mag_db, phase_deg, extra
+        cmd_echo, mag_db, phase_deg, extra = struct.unpack('<BBff', data[:10])
+    except struct.error as e:
+        logger.error(f'Response parse failed: {e} (raw: {_hex(data)})')
+        return None
+
+    logger.debug(f'Response parsed: cmd=0x{cmd_echo:02X} mag={mag_db:.4f}dB '
+                 f'phase={phase_deg:.4f}deg extra={extra} (raw: {_hex(data[:10])})')
 
     return {
         'cmd': cmd_echo,
@@ -194,32 +210,47 @@ class SerialManager:
         if ok:
             logger.info(f'Serial sent: type={effect_type} freq={freq_hz} mag={magnitude} '
                         f'settle={settle_periods} ramp={ramp_periods} '
-                        f'maxTorque={max_torque_nm:.1f}Nm')
+                        f'maxTorque={max_torque_nm:.1f}Nm '
+                        f'(raw: {_hex(packet)})')
+        else:
+            logger.error(f'Serial send FAILED: type={effect_type} freq={freq_hz} mag={magnitude} '
+                         f'(raw: {_hex(packet)})')
+        return ok
+
+    def _send_named(self, name: str, packet: Optional[bytes]) -> bool:
+        '''Write a packet and log both the simplified name and the raw bytes.'''
+        if packet is None:
+            return False
+        ok = self._write_packet(packet)
+        if ok:
+            logger.info(f'Serial sent: {name} (raw: {_hex(packet)})')
+        else:
+            logger.error(f'Serial send FAILED: {name} (raw: {_hex(packet)})')
         return ok
 
     def send_stop(self) -> bool:
         '''Send stop command (Bode_Stop). No response expected.'''
         if not self.is_connected:
             return False
-        return self._write_packet(_pack_command('stop'))
+        return self._send_named('stop', _pack_command('stop'))
 
     def send_center(self) -> bool:
         '''Send center command (Bode_Center). No response expected.'''
         if not self.is_connected:
             return False
-        return self._write_packet(_pack_command('center'))
+        return self._send_named('center', _pack_command('center'))
 
     def send_scale(self) -> bool:
         '''Send scale calibration command (Bode_ScaleCal). No response expected.'''
         if not self.is_connected:
             return False
-        return self._write_packet(_pack_command('scale'))
+        return self._send_named('scale', _pack_command('scale'))
 
     def send_selftest(self) -> bool:
         '''Send selftest command (synthetic cosine sweep). Expects 0xBB response.'''
         if not self.is_connected:
             return False
-        return self._write_packet(_pack_command('selftest'))
+        return self._send_named('selftest', _pack_command('selftest'))
 
     def _read_loop(self):
         '''Background thread: read bytes from serial port.'''
@@ -257,12 +288,13 @@ class SerialManager:
                 break
 
             packet = bytes(self._buffer[:10])
+            logger.debug(f'Serial received packet (raw: {_hex(packet)})')
             parsed = _parse_response(packet)
             if parsed and self._on_response:
                 try:
                     self._on_response(parsed)
                 except Exception as e:
-                    logger.error(f'Response callback error: {e}')
+                    logger.error(f'Response callback error: {e} (raw: {_hex(packet)})')
 
             self._buffer = self._buffer[10:]
 

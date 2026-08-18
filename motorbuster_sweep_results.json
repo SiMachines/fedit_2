@@ -1,0 +1,76 @@
+{
+  "config": {
+    "freq_min_hz": 50.0,
+    "freq_max_hz": 500.0,
+    "num_frequencies": 10,
+    "spacing": "logarithmic",
+    "amplitude": 3276,
+    "max_torque_nm": 25.0,
+    "settling_periods": 2,
+    "ramp_periods": 1
+  },
+  "results": [
+    {
+      "freq_hz": 50.0,
+      "mag_db": 1.0,
+      "phase_deg": -13.2401,
+      "valid": true
+    },
+    {
+      "freq_hz": 64.5774832507442,
+      "mag_db": 1.0,
+      "phase_deg": -13.9432,
+      "valid": true
+    },
+    {
+      "freq_hz": 83.40502686000293,
+      "mag_db": 1.0,
+      "phase_deg": -16.4128,
+      "valid": true
+    },
+    {
+      "freq_hz": 107.72173450159418,
+      "mag_db": 1.0,
+      "phase_deg": -14.2069,
+      "valid": true
+    },
+    {
+      "freq_hz": 139.12797011035622,
+      "mag_db": 1.0,
+      "phase_deg": -17.0242,
+      "valid": true
+    },
+    {
+      "freq_hz": 179.69068319023137,
+      "mag_db": 1.0,
+      "phase_deg": -7.4694,
+      "valid": true
+    },
+    {
+      "freq_hz": 232.07944168063898,
+      "mag_db": 1.0,
+      "phase_deg": -16.8389,
+      "valid": true
+    },
+    {
+      "freq_hz": 299.7421251594705,
+      "mag_db": 1.0,
+      "phase_deg": -5.5936,
+      "valid": true
+    },
+    {
+      "freq_hz": 387.13184134056354,
+      "mag_db": 1.0,
+      "phase_deg": 0.2368,
+      "valid": true
+    },
+    {
+      "freq_hz": 500.0,
+      "mag_db": 1.0,
+      "phase_deg": -1.1564,
+      "valid": true
+    }
+  ],
+  "status": "complete",
+  "duration_s": 3.71
+}
