@@ -111,14 +111,15 @@ def _parse_response(data: bytes) -> Optional[dict]:
         return None
 
     try:
-        # NOTE: '<BBff' unpacks FOUR values (B, B, f, f) -> cmd_echo, mag_db, phase_deg, extra
-        cmd_echo, mag_db, phase_deg, extra = struct.unpack('<BBff', data[:10])
+        # Format: [0xBB][cmd_echo:1B][Mag:4B float dB][Ph_D:4B float deg]
+        # '<BBff' unpacks FOUR values: start_byte, cmd_echo, mag_db, phase_deg
+        start_byte, cmd_echo, mag_db, phase_deg = struct.unpack('<BBff', data[:10])
     except struct.error as e:
         logger.error(f'Response parse failed: {e} (raw: {_hex(data)})')
         return None
 
-    logger.debug(f'Response parsed: cmd=0x{cmd_echo:02X} mag={mag_db:.4f}dB '
-                 f'phase={phase_deg:.4f}deg extra={extra} (raw: {_hex(data[:10])})')
+    logger.debug(f'Response parsed: start=0x{start_byte:02X} cmd=0x{cmd_echo:02X} '
+                 f'mag={mag_db:.4f}dB phase={phase_deg:.4f}deg (raw: {_hex(data[:10])})')
 
     return {
         'cmd': cmd_echo,

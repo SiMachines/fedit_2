@@ -2069,6 +2069,26 @@ class MotorBusterNativeApp:
         except Exception:
             return None
 
+    def _apply_dark_title_bar(self):
+        """Make the native Windows title bar dark (immersive dark mode)."""
+        try:
+            import ctypes
+            hwnd = self._get_viewport_hwnd()
+            if not hwnd:
+                return
+            # DWMWA_USE_IMMERSIVE_DARK_MODE = 20 (Windows 10 1903+)
+            # Older builds use attribute 19; try 20 first, then 19.
+            value = ctypes.c_int(1)
+            for attr in (20, 19):
+                try:
+                    ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                        hwnd, attr, ctypes.byref(value), ctypes.sizeof(value))
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
     def _apply_hover_highlight(self, tag, cfg, highlighted):
         if not dpg.does_item_exist(tag):
             return
@@ -4491,6 +4511,7 @@ class MotorBusterNativeApp:
                             
         dpg.setup_dearpygui()
         dpg.show_viewport()
+        self._apply_dark_title_bar()
         engine.set_directinput_hwnd(self._get_viewport_hwnd())
         
         # Restore Maximized State / Apply Theme

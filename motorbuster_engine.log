@@ -2303,3 +2303,30 @@
 2026-08-18 18:15:51,872 INFO:FFB_Engine:SDL3 custom events registered: {'EFFECT_START': 32768, 'EFFECT_STOP': 32769, 'POSITION_REQUEST': 32770}
 2026-08-18 18:15:52,007 INFO:FFB_Engine:Loaded DirectInput provider: unity_di (C:\Users\ernes\Documents\PlatformIO\Projects\MotorBusterSTM32F407\MotorBuster\DirectInputForceFeedback.dll)
 2026-08-18 18:15:52,050 INFO:FFB_Engine:DirectInput scan found no DI devices
+2026-08-18 18:19:12,984 INFO:FFB_Engine:SDL3 custom events registered: {'EFFECT_START': 32768, 'EFFECT_STOP': 32769, 'POSITION_REQUEST': 32770}
+2026-08-18 18:19:13,125 INFO:FFB_Engine:Loaded DirectInput provider: unity_di (C:\Users\ernes\Documents\PlatformIO\Projects\MotorBusterSTM32F407\MotorBuster\DirectInputForceFeedback.dll)
+2026-08-18 18:19:13,166 INFO:FFB_Engine:DirectInput scan found no DI devices
+2026-08-18 18:40:50,785 INFO:FFB_Engine:SDL3 custom events registered: {'EFFECT_START': 32768, 'EFFECT_STOP': 32769, 'POSITION_REQUEST': 32770}
+2026-08-18 18:40:50,913 INFO:FFB_Engine:Loaded DirectInput provider: unity_di (C:\Users\ernes\Documents\PlatformIO\Projects\MotorBusterSTM32F407\MotorBuster\DirectInputForceFeedback.dll)
+2026-08-18 18:40:50,956 INFO:FFB_Engine:DirectInput scan found no DI devices
+2026-08-18 18:47:56,157 INFO:FFB_Engine:SDL3 custom events registered: {'EFFECT_START': 32768, 'EFFECT_STOP': 32769, 'POSITION_REQUEST': 32770}
+2026-08-18 18:47:56,281 INFO:FFB_Engine:Loaded DirectInput provider: unity_di (C:\Users\ernes\Documents\PlatformIO\Projects\MotorBusterSTM32F407\MotorBuster\DirectInputForceFeedback.dll)
+2026-08-18 18:47:56,324 INFO:FFB_Engine:DirectInput scan found no DI devices
+2026-08-18 18:50:56,510 INFO:FFB_Engine:SDL3 custom events registered: {'EFFECT_START': 32768, 'EFFECT_STOP': 32769, 'POSITION_REQUEST': 32770}
+2026-08-18 18:50:56,647 INFO:FFB_Engine:Loaded DirectInput provider: unity_di (C:\Users\ernes\Documents\PlatformIO\Projects\MotorBusterSTM32F407\MotorBuster\DirectInputForceFeedback.dll)
+2026-08-18 18:50:56,691 INFO:FFB_Engine:DirectInput scan found no DI devices
+2026-08-18 18:53:18,520 INFO:FFB_Engine:SDL3 custom events registered: {'EFFECT_START': 32768, 'EFFECT_STOP': 32769, 'POSITION_REQUEST': 32770}
+2026-08-18 18:53:18,653 INFO:FFB_Engine:Loaded DirectInput provider: unity_di (C:\Users\ernes\Documents\PlatformIO\Projects\MotorBusterSTM32F407\MotorBuster\DirectInputForceFeedback.dll)
+2026-08-18 18:53:18,697 INFO:FFB_Engine:DirectInput scan found no DI devices
+2026-08-18 19:10:29,051 INFO:FFB_Engine:SDL3 custom events registered: {'EFFECT_START': 32768, 'EFFECT_STOP': 32769, 'POSITION_REQUEST': 32770}
+2026-08-18 19:10:29,175 INFO:FFB_Engine:Loaded DirectInput provider: unity_di (C:\Users\ernes\Documents\PlatformIO\Projects\MotorBusterSTM32F407\MotorBuster\DirectInputForceFeedback.dll)
+2026-08-18 19:10:29,220 INFO:FFB_Engine:DirectInput scan found no DI devices
+2026-08-18 19:33:00,473 INFO:FFB_Engine:SDL3 custom events registered: {'EFFECT_START': 32768, 'EFFECT_STOP': 32769, 'POSITION_REQUEST': 32770}
+2026-08-18 19:33:00,600 INFO:FFB_Engine:Loaded DirectInput provider: unity_di (C:\Users\ernes\Documents\PlatformIO\Projects\MotorBusterSTM32F407\MotorBuster\DirectInputForceFeedback.dll)
+2026-08-18 19:33:00,643 INFO:FFB_Engine:DirectInput scan found no DI devices
+2026-08-18 19:59:15,204 INFO:FFB_Engine:SDL3 custom events registered: {'EFFECT_START': 32768, 'EFFECT_STOP': 32769, 'POSITION_REQUEST': 32770}
+2026-08-18 19:59:15,317 INFO:FFB_Engine:Loaded DirectInput provider: unity_di (C:\Users\ernes\Documents\PlatformIO\Projects\MotorBusterSTM32F407\MotorBuster\DirectInputForceFeedback.dll)
+2026-08-18 19:59:15,361 INFO:FFB_Engine:DirectInput scan found no DI devices
+2026-08-18 19:59:24,691 INFO:FFB_Engine:SDL3 custom events registered: {'EFFECT_START': 32768, 'EFFECT_STOP': 32769, 'POSITION_REQUEST': 32770}
+2026-08-18 19:59:24,814 INFO:FFB_Engine:Loaded DirectInput provider: unity_di (C:\Users\ernes\Documents\PlatformIO\Projects\MotorBusterSTM32F407\MotorBuster\DirectInputForceFeedback.dll)
+2026-08-18 19:59:24,856 INFO:FFB_Engine:DirectInput scan found no DI devices

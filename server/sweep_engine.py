@@ -39,10 +39,27 @@ class SweepConfig:
     single_simulation: bool = True
     perform_filtering: bool = True
 
+    def get_period_duration(self, freq_hz: float) -> float:
+        '''Return the duration of one period in seconds.'''
+        return 1.0 / max(freq_hz, 0.1)
+
     def get_frequencies(self) -> list[float]:
-        '''Compute the frequency list based on config.'''
+        '''Compute the frequency list based on config.
+
+        For self-test sweeps, frequencies are snapped to integer divisors of
+        the MCU sample rate (200000 Hz).  The demodulator averages over
+        w_avg = int(200000/f) samples; when 200000/f is not an integer the
+        window captures a partial cycle, leaving a residual DC bias in the
+        I/Q averages that shifts the measured phase by up to ~0.3 deg.  Using
+        frequencies that divide 200000 makes the window an exact integer
+        number of periods, so the self-test phase stays flat at 90 deg.
+        '''
         if self.num_frequencies < 1:
             return []
+
+        if self.command_type == 'selftest':
+            return self._snap_to_sample_rate_divisors()
+
         if self.num_frequencies == 1:
             return [self.freq_min_hz]
 
@@ -53,9 +70,43 @@ class SweepConfig:
             step = (self.freq_max_hz - self.freq_min_hz) / (self.num_frequencies - 1)
             return [self.freq_min_hz + step * i for i in range(self.num_frequencies)]
 
-    def get_period_duration(self, freq_hz: float) -> float:
-        '''Return the duration of one period in seconds.'''
-        return 1.0 / max(freq_hz, 0.1)
+    def _snap_to_sample_rate_divisors(self) -> list[float]:
+        '''Return self-test frequencies that divide the 200000 Hz sample rate.
+
+        Divisors of 200000 within [freq_min_hz, freq_max_hz], chosen to keep
+        roughly logarithmic spacing.  These make the demodulator averaging
+        window an exact integer number of periods (phase error ~0).
+        '''
+        sample_rate = 200000
+        # Divisors of 200000 = 2^6 * 5^5 in the sweep range
+        divisors = [f for f in range(int(self.freq_min_hz), int(self.freq_max_hz) + 1)
+                    if sample_rate % f == 0]
+        if not divisors:
+            # Fallback: nearest divisors around the requested range
+            divisors = [f for f in range(1, sample_rate + 1)
+                        if sample_rate % f == 0]
+            divisors = [f for f in divisors
+                        if self.freq_min_hz <= f <= self.freq_max_hz]
+        if not divisors:
+            return [self.freq_min_hz]
+
+        # Pick up to num_frequencies with roughly logarithmic spacing
+        if len(divisors) <= self.num_frequencies:
+            return [float(f) for f in divisors]
+
+        # Log-spaced selection from the divisor list
+        import math
+        log_min, log_max = math.log(divisors[0]), math.log(divisors[-1])
+        selected = []
+        for i in range(self.num_frequencies):
+            if self.num_frequencies == 1:
+                target = divisors[0]
+            else:
+                log_target = log_min + (log_max - log_min) * i / (self.num_frequencies - 1)
+                target = min(divisors, key=lambda f: abs(math.log(f) - log_target))
+            if target not in selected:
+                selected.append(target)
+        return [float(f) for f in sorted(selected)]
 
 
 @dataclass
