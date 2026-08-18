@@ -2255,3 +2255,12 @@
 2026-08-17 13:37:55,752 INFO:FFB_Engine:DirectInput backend ignores SDL device index; using first available DI device
 2026-08-17 13:37:55,920 INFO:FFB_Engine:DirectInput backend initialized via Unity DI for guid={8424D4D0-5664-11F0-8001-444553540000}
 2026-08-17 13:37:55,921 INFO:FFB_Engine:DirectInput backend active; SDL haptics disabled.
+2026-08-18 15:21:22,538 INFO:FFB_Engine:SDL3 custom events registered: {'EFFECT_START': 32768, 'EFFECT_STOP': 32769, 'POSITION_REQUEST': 32770}
+2026-08-18 15:21:22,675 INFO:FFB_Engine:Loaded DirectInput provider: unity_di (C:\Users\ernes\Documents\PlatformIO\Projects\MotorBusterSTM32F407\MotorBuster\DirectInputForceFeedback.dll)
+2026-08-18 15:21:22,740 INFO:FFB_Engine:DirectInput scan found no DI devices
+2026-08-18 15:21:32,068 INFO:FFB_Engine:SDL3 custom events registered: {'EFFECT_START': 32768, 'EFFECT_STOP': 32769, 'POSITION_REQUEST': 32770}
+2026-08-18 15:21:32,199 INFO:FFB_Engine:Loaded DirectInput provider: unity_di (C:\Users\ernes\Documents\PlatformIO\Projects\MotorBusterSTM32F407\MotorBuster\DirectInputForceFeedback.dll)
+2026-08-18 15:21:32,264 INFO:FFB_Engine:DirectInput scan found no DI devices
+2026-08-18 15:23:15,068 INFO:FFB_Engine:SDL3 custom events registered: {'EFFECT_START': 32768, 'EFFECT_STOP': 32769, 'POSITION_REQUEST': 32770}
+2026-08-18 15:23:15,189 INFO:FFB_Engine:Loaded DirectInput provider: unity_di (C:\Users\ernes\Documents\PlatformIO\Projects\MotorBusterSTM32F407\MotorBuster\DirectInputForceFeedback.dll)
+2026-08-18 15:23:15,254 INFO:FFB_Engine:DirectInput scan found no DI devices

@@ -1,4 +1,3 @@
-import dearpygui.dearpygui as dpg
 import sys
 import os
 import time
@@ -25,6 +24,10 @@ if getattr(sys, 'frozen', False):
 else:
     base_path = os.path.dirname(os.path.abspath(__file__))
     sys.path.append(os.path.join(base_path, '.dependencies'))
+
+# DearPyGui lives in .dependencies (not site-packages), so it must be imported
+# AFTER the path fix above.
+import dearpygui.dearpygui as dpg
 from server.ffb_engine import engine, DeviceInfo
 from server.serial_manager import serial_manager, scan_ports
 from server.sweep_engine import sweep_engine, SweepConfig, SweepData

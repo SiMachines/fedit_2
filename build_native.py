@@ -51,10 +51,10 @@ args = [
     '--clean',                   # Clean cache
     '--windowed',                # No terminal window
     '--collect-all=dearpygui',   # Collect DPG assets
-    '--collect-all=dearpygui',   # Collect DPG assets
     '--collect-all=pysdl2_dll',  # Collect SDL2 dll wrapper if any
     '--collect-submodules=server', # Ensure server package is collected
     '--paths=.',                 # Add root to search path
+    f'--paths={DEPENDENCIES_DIR}',  # Add .dependencies so PyInstaller can find dearpygui
     
     # Exclude unnecessary web/server stuff to save size
     '--exclude-module=uvicorn',
