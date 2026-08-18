@@ -21,7 +21,7 @@ MEASURE_CYCLES_ESTIMATE = 8
 class SweepConfig:
     '''Configuration for a sinestream sweep.'''
     # Frequency range
-    freq_min_hz: float = 10.0
+    freq_min_hz: float = 30.0  # min 30 Hz: below this the firmware w_avg moving average overflows
     freq_max_hz: float = 500.0
     num_frequencies: int = 20
     spacing: str = 'logarithmic'  # 'logarithmic' or 'linear'
@@ -31,6 +31,9 @@ class SweepConfig:
     max_torque_nm: float = 25.0
     settling_periods: int = 2  # 0..4 (rtP.s_period)
     ramp_periods: int = 1      # 0..1 (rtP.r_period)
+
+    # Command type to send for each sweep point (e.g. 'sine', 'constant', 'selftest')
+    command_type: str = 'sine'
 
     # Execution
     single_simulation: bool = True
@@ -122,26 +125,29 @@ class SweepEngine:
         self.on_progress: Optional[Callable[[int, int, str], None]] = None
         self.on_complete: Optional[Callable[[SweepData], None]] = None
         self.on_log: Optional[Callable[[str], None]] = None
+        self.on_check_connection: Optional[Callable[[], bool]] = None
 
     @property
     def is_running(self) -> bool:
         return self._running
 
-    def _log(self, msg: str):
+    def _log(self, msg: str, level: str = 'info'):
         if self.on_log:
-            self.on_log(msg)
+            self.on_log(msg, level)
 
     def set_callbacks(self,
                       on_send_effect: Optional[Callable] = None,
                       on_send_stop: Optional[Callable] = None,
                       on_progress: Optional[Callable] = None,
                       on_complete: Optional[Callable] = None,
-                      on_log: Optional[Callable] = None):
+                      on_log: Optional[Callable] = None,
+                      on_check_connection: Optional[Callable] = None):
         self.on_send_effect = on_send_effect
         self.on_send_stop = on_send_stop
         self.on_progress = on_progress
         self.on_complete = on_complete
         self.on_log = on_log
+        self.on_check_connection = on_check_connection
 
     def handle_response(self, data: dict):
         '''Called by the serial manager when a response packet arrives.'''
@@ -190,15 +196,20 @@ class SweepEngine:
                     # Send the sweep-point command; the MCU runs settle + measure
                     # internally and replies with a 0xBB response when Ready.
                     if self.on_send_effect:
-                        self.on_send_effect('sine', freq_hz, config.amplitude,
+                        self.on_send_effect(config.command_type, freq_hz, config.amplitude,
                                             config.settling_periods,
                                             config.ramp_periods,
                                             config.max_torque_nm)
 
-                    # Wait for the MCU response.
-                    timeout = period_dur * (config.settling_periods +
-                                            config.ramp_periods +
-                                            MEASURE_CYCLES_ESTIMATE) + 1.0
+                    # Wait for the MCU response. Account for settle + ramp +
+                    # measure cycles (each scaled by the period duration), add
+                    # a fixed buffer for USB/processing overhead, then a 10%
+                    # margin so the MCU has time to actually output before we
+                    # consider it a timeout. Low frequencies need more headroom.
+                    base_timeout = period_dur * (config.settling_periods +
+                                                 config.ramp_periods +
+                                                 MEASURE_CYCLES_ESTIMATE) + 2.0
+                    timeout = base_timeout * 1.10
                     got_response = self._response_event.wait(timeout=timeout)
 
                     result = SweepResult(freq_hz=freq_hz)
@@ -211,10 +222,24 @@ class SweepEngine:
                         self._log(f'  Result: Mag = {result.mag_db:.2f} dB, '
                                   f'Phase = {result.phase_deg:.2f} deg')
                     else:
-                        self._log('  Result: No response (timeout)')
-                        result.valid = False
+                        # The MCU did not respond within the settle + ramp +
+                        # measure window. This means the MCU is not running the
+                        # expected sweep, so abort the whole sweep.
+                        self._log('  Result: No response (timeout) - MCU did not '
+                                  'respond when expected, stopping sweep',
+                                  level='error')
+                        self._data.status = 'error'
+                        self._data.results.append(result)
+                        break
 
                     self._data.results.append(result)
+
+                    # If the MCU connection was lost at any point, stop the sweep.
+                    if self.on_check_connection and not self.on_check_connection():
+                        self._log('MCU connection lost - stopping sweep',
+                                  level='error')
+                        self._data.status = 'error'
+                        break
 
                     # Small gap between frequencies
                     if idx < total - 1:
@@ -226,7 +251,7 @@ class SweepEngine:
                         self.on_progress(idx + 1, total, f'Freq {freq_hz:.1f} Hz')
 
             except Exception as e:
-                self._log(f'Sweep error: {e}')
+                self._log(f'Sweep error: {e}', level='error')
                 self._data.status = 'error'
             finally:
                 # Send stop command
@@ -275,7 +300,7 @@ class SweepEngine:
                 json.dump(self._data.to_dict(), f, indent=2)
             self._log(f'Results exported to {path}')
         except Exception as e:
-            self._log(f'Export failed: {e}')
+            self._log(f'Export failed: {e}', level='error')
 
     def _on_frequency_start(self, idx: int, total: int, freq_hz: float):
         '''Called before each frequency starts (override for UI updates).'''

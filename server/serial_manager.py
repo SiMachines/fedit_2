@@ -36,6 +36,16 @@ EFFECT_CMD_MAP = {
     'stop': CMD_STOP,
 }
 
+# Reverse map: command byte -> human-readable name (for response logging)
+CMD_NAME_MAP = {
+    CMD_SINE: 'sine',
+    CMD_CONSTANT: 'constant',
+    CMD_CENTER: 'center',
+    CMD_SCALE: 'scale',
+    CMD_SELFTEST: 'selftest',
+    CMD_STOP: 'stop',
+}
+
 
 def scan_ports() -> list[dict]:
     '''Scan available serial ports and return list of {port, description}.'''
@@ -217,15 +227,25 @@ class SerialManager:
                          f'(raw: {_hex(packet)})')
         return ok
 
-    def _send_named(self, name: str, packet: Optional[bytes]) -> bool:
-        '''Write a packet and log both the simplified name and the raw bytes.'''
+    def _send_named(self, name: str, packet: Optional[bytes],
+                    freq_hz: float = 0.0, magnitude: int = 0,
+                    settle_periods: int = 0, ramp_periods: int = 0,
+                    max_torque_nm: float = 0.0) -> bool:
+        '''Write a packet and log the name, parameters, and raw bytes.
+
+        Logs consistently with send_effect so every send shows the same detail.
+        '''
         if packet is None:
             return False
         ok = self._write_packet(packet)
         if ok:
-            logger.info(f'Serial sent: {name} (raw: {_hex(packet)})')
+            logger.info(f'Serial sent: type={name} freq={freq_hz} mag={magnitude} '
+                        f'settle={settle_periods} ramp={ramp_periods} '
+                        f'maxTorque={max_torque_nm:.1f}Nm '
+                        f'(raw: {_hex(packet)})')
         else:
-            logger.error(f'Serial send FAILED: {name} (raw: {_hex(packet)})')
+            logger.error(f'Serial send FAILED: type={name} freq={freq_hz} mag={magnitude} '
+                         f'(raw: {_hex(packet)})')
         return ok
 
     def send_stop(self) -> bool:
@@ -246,11 +266,17 @@ class SerialManager:
             return False
         return self._send_named('scale', _pack_command('scale'))
 
-    def send_selftest(self) -> bool:
+    def send_selftest(self, freq_hz: float = 0.0, magnitude: int = 0,
+                      settle_periods: int = 0, ramp_periods: int = 0,
+                      max_torque_nm: float = 0.0) -> bool:
         '''Send selftest command (synthetic cosine sweep). Expects 0xBB response.'''
         if not self.is_connected:
             return False
-        return self._send_named('selftest', _pack_command('selftest'))
+        return self._send_named('selftest', _pack_command('selftest', freq_hz, magnitude,
+                                                          settle_periods, ramp_periods,
+                                                          max_torque_nm),
+                                freq_hz, magnitude, settle_periods, ramp_periods,
+                                max_torque_nm)
 
     def _read_loop(self):
         '''Background thread: read bytes from serial port.'''
@@ -288,8 +314,16 @@ class SerialManager:
                 break
 
             packet = bytes(self._buffer[:10])
-            logger.debug(f'Serial received packet (raw: {_hex(packet)})')
             parsed = _parse_response(packet)
+            if parsed:
+                cmd = parsed.get('cmd', 0)
+                cmd_name = CMD_NAME_MAP.get(cmd, f'0x{cmd:02X}')
+                logger.info(f'Serial received: type={cmd_name} '
+                            f'mag={parsed.get("mag_db", 0.0):.4f}dB '
+                            f'phase={parsed.get("phase_deg", 0.0):.4f}deg '
+                            f'(raw: {_hex(packet)})')
+            else:
+                logger.info(f'Serial received: unparsed (raw: {_hex(packet)})')
             if parsed and self._on_response:
                 try:
                     self._on_response(parsed)

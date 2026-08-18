@@ -31,7 +31,23 @@ import dearpygui.dearpygui as dpg
 from server.ffb_engine import engine, DeviceInfo
 from server.serial_manager import serial_manager, scan_ports
 from server.sweep_engine import sweep_engine, SweepConfig, SweepData
- 
+
+import logging
+
+
+class SystemLogHandler(logging.Handler):
+    """Forward logging records (errors/warnings) to the app's system log panel."""
+    def __init__(self, app):
+        super().__init__()
+        self._app = app
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self._app.log(f"[{record.levelname}] {msg}")
+        except Exception:
+            pass
+
 # --- Data Model ---
 @dataclass
 class Clip:
@@ -430,6 +446,19 @@ class MotorBusterNativeApp:
         self.drag_target_track_idx = -1 # For visual highlight
         self.inspectors = [] # List of InspectorPanel instances
         self.api_log_items = []
+
+        # Forward serial-manager errors/warnings to the system log panel.
+        # The handler is set to WARNING so routine INFO "sent/received" traffic
+        # stays out of the system log; only errors/warnings appear there.
+        try:
+            import logging as _logging
+            _serial_logger = _logging.getLogger('Serial_Manager')
+            _handler = SystemLogHandler(self)
+            _handler.setLevel(_logging.WARNING)
+            _serial_logger.addHandler(_handler)
+            _serial_logger.setLevel(_logging.INFO)
+        except Exception:
+            pass
         self.resize_threshold_px = 12.0
         self._console_opened = False
         self.sweep_markers = []  # [{"time": float, "phase": int}]
@@ -541,6 +570,7 @@ class MotorBusterNativeApp:
             on_progress=self._sweep_engine_progress,
             on_complete=self._sweep_engine_complete,
             on_log=self._sweep_engine_log,
+            on_check_connection=self._sweep_engine_check_connection,
         )
 
     @staticmethod
@@ -1177,6 +1207,8 @@ class MotorBusterNativeApp:
             dpg.set_value("serial_port_combo", items[0])
             self.serial_selected_port = ports[0]["port"]
             self.log(f"Found {len(ports)} serial port(s)")
+            # Auto-connect to the first found port
+            self._connect_to_selected_port()
         else:
             dpg.configure_item("serial_port_combo", items=["No ports found"])
             dpg.set_value("serial_port_combo", "No ports found")
@@ -1188,6 +1220,8 @@ class MotorBusterNativeApp:
             if p["description"] == app_data:
                 self.serial_selected_port = p["port"]
                 break
+        # Auto-connect to the newly selected port
+        self._connect_to_selected_port()
 
     def _on_serial_baud_changed(self, sender, app_data):
         """Called when baud rate changes."""
@@ -1207,10 +1241,23 @@ class MotorBusterNativeApp:
             self.log("Serial disconnected")
             return
 
+        self._connect_to_selected_port()
+
+    def _connect_to_selected_port(self):
+        """Connect to the currently selected port (no toggle)."""
         port = self.serial_selected_port
         if not port:
             self.log("No serial port selected")
             return
+
+        # If already connected to this port, nothing to do.
+        if self.serial_connected and serial_manager.port_name == port:
+            return
+
+        # Switching ports: disconnect the old one first.
+        if self.serial_connected:
+            serial_manager.disconnect()
+            self.serial_connected = False
 
         if serial_manager.connect(port, self.serial_baud):
             self.serial_connected = True
@@ -1230,7 +1277,9 @@ class MotorBusterNativeApp:
         if dpg.does_item_exist('txt_serial_timing'):
             dpg.set_value('txt_serial_timing', f'Mag = {mag_db:.2f} dB | Phase = {phase_deg:.2f}°')
             dpg.configure_item('txt_serial_timing', color=(100, 255, 100))
-        self.log(f'Serial Response: Mag={mag_db:.2f} dB, Phase={phase_deg:.2f}°')
+        # Route MCU sweep responses to the terminal debug console (not system log)
+        self._ensure_api_console()
+        print(f'Serial Response: Mag={mag_db:.2f} dB, Phase={phase_deg:.2f}°')
 
         # Also surface the response in the Cmd tab if waiting on a manual command
         if getattr(self, '_cmd_expects_response', False) and dpg.does_item_exist('txt_cmd_status'):
@@ -1265,11 +1314,21 @@ class MotorBusterNativeApp:
                    'scale': '0x09', 'selftest': '0xFE', 'stop': '0xFF'}.get(key, '0x??')
         expects_response = key in ('sine', 'constant', 'selftest')
 
-        freq = max(1.0, dpg.get_value('cmd_freq'))
-        mag_pct = dpg.get_value('cmd_mag_pct')
-        settle = dpg.get_value('cmd_settle')
-        ramp = dpg.get_value('cmd_ramp')
-        max_torque = dpg.get_value('cmd_max_torque')
+        # Parameter fields were removed from the UI (only the selector remains).
+        # Fall back to the sweep panel values, or safe defaults.
+        def _val(tag, default):
+            if dpg.does_item_exist(tag):
+                try:
+                    return dpg.get_value(tag)
+                except Exception:
+                    return default
+            return default
+
+        freq = max(30.0, _val('cmd_freq', _val('sweep_freq_min', 30.0)))
+        mag_pct = _val('cmd_mag_pct', _val('sweep_torque_pct', 10))
+        settle = _val('cmd_settle', _val('sweep_settling', 2))
+        ramp = _val('cmd_ramp', _val('sweep_ramp', 1))
+        max_torque = _val('cmd_max_torque', _val('sweep_max_torque', 25.0))
         mag = int(32767 * mag_pct / 100.0)
 
         if key == 'center':
@@ -1279,7 +1338,7 @@ class MotorBusterNativeApp:
         elif key == 'stop':
             ok = serial_manager.send_stop()
         elif key == 'selftest':
-            ok = serial_manager.send_selftest()
+            ok = serial_manager.send_selftest(freq, mag, settle, ramp, max_torque)
         else:  # sine / constant
             ok = serial_manager.send_effect(key, freq, mag, settle, ramp, max_torque)
 
@@ -1289,7 +1348,10 @@ class MotorBusterNativeApp:
 
         if expects_response:
             if key in ('sine', 'constant'):
-                self._cmd_timeout = (1.0 / freq) * (settle + ramp + 8) + 1.0
+                # Account for settle + ramp + measure, add a fixed buffer for
+                # USB/processing overhead, then a 10% margin so the MCU has
+                # time to output before we time out. Low freq needs headroom.
+                self._cmd_timeout = ((1.0 / freq) * (settle + ramp + 8) + 2.0) * 1.10
             else:  # selftest
                 self._cmd_timeout = 5.0
             self._cmd_expects_response = True
@@ -1335,76 +1397,132 @@ class MotorBusterNativeApp:
         dpg.set_value("sweep_max_torque", detected_torque)
         self._on_sweep_torque_slider(None, dpg.get_value("sweep_torque_pct"))
 
-    def _open_sweep_panel(self, sender=None, app_data=None):
-        """Open the Create Sinestream Sweep dialog window."""
-        # Delete stale cached window to ensure fresh UI
-        if dpg.does_item_exist("win_sweep_v2"):
-            dpg.delete_item("win_sweep_v2")
+    def _toggle_test_window(self, sender=None, app_data=None):
+        """Show/hide the unified Test window (connection + command + sweep + Bode)."""
+        if dpg.does_item_exist("win_test"):
+            if dpg.is_item_shown("win_test"):
+                dpg.hide_item("win_test")
+            else:
+                dpg.show_item("win_test")
+                dpg.focus_item("win_test")
+        else:
+            self._open_test_window()
 
-        width, height = 650, 580
+    def _open_test_window(self, sender=None, app_data=None):
+        """Create the unified Test window (connection, command selector, sweep, Bode plots)."""
+        if dpg.does_item_exist("win_test"):
+            dpg.delete_item("win_test")
+
+        width, height = 820, 780
         vp_w = dpg.get_viewport_width()
         vp_h = dpg.get_viewport_height()
         pos = [(vp_w - width) // 2, (vp_h - height) // 2]
-        
-        with dpg.window(tag="win_sweep_v2", label="Sinestream Sweep", width=width, height=height,
-                        pos=pos, modal=False, no_resize=False, on_close=lambda: None):
-            
-            dpg.add_text("Frequency Range", color=(200, 200, 255))
+
+        with dpg.window(tag="win_test", label="Test", autosize=True,
+                        pos=pos, no_resize=False):
+            # --- Connection section ---
+            dpg.add_text("Connection", color=(200, 200, 255))
+            dpg.add_separator()
+            with dpg.group(horizontal=True):
+                dpg.add_combo(tag="serial_port_combo", width=220, callback=self._on_serial_port_selected)
+                dpg.add_button(label="Scan", callback=self._scan_serial_ports)
+            with dpg.group(horizontal=True):
+                dpg.add_combo(tag="serial_baud_combo", width=100, default_value="115200",
+                              items=["9600","19200","38400","57600","115200","230400","460800","921600"],
+                              callback=self._on_serial_baud_changed)
+                dpg.add_button(label="Connect", tag="btn_serial_connect", callback=self._connect_serial)
+            dpg.add_text("COM: Offline", tag="txt_serial_status", color=(100, 100, 100))
+
+            dpg.add_spacer(height=8)
             dpg.add_separator()
 
+            # --- Command selector section ---
+            dpg.add_text("Command", color=(200, 200, 255))
+            dpg.add_separator()
+            with dpg.group(horizontal=True):
+                dpg.add_combo(label="Command", tag="cmd_selector", width=200,
+                              items=["SINE (0x01)", "CONSTANT (0x06)", "CENTER (0x08)",
+                                     "SCALE (0x09)", "SELFTEST (0xFE)", "STOP (0xFF)"],
+                              default_value="SINE (0x01)", callback=self._on_cmd_selector_change)
+                dpg.add_button(label="Send", tag="btn_cmd_send", width=80, callback=self._cmd_send)
+                dpg.add_button(label="STOP", tag="btn_cmd_stop", width=70, callback=self._cmd_send_stop)
+            dpg.add_text("Status: idle", tag="txt_cmd_status", wrap=500, color=(180, 220, 180))
+
+            dpg.add_spacer(height=8)
+            dpg.add_separator()
+
+            # --- Sweep section ---
+            dpg.add_text("Sweep", color=(200, 200, 255))
+            dpg.add_separator()
             with dpg.group(horizontal=True):
                 dpg.add_text("Min (Hz):")
-                dpg.add_input_float(tag="sweep_freq_min", default_value=10.0, width=100, step=0)
-                dpg.add_spacer(width=20)
+                dpg.add_input_float(tag="sweep_freq_min", default_value=30.0, width=100, step=0, min_value=30.0)
+                dpg.add_spacer(width=15)
                 dpg.add_text("Max (Hz):")
                 dpg.add_input_float(tag="sweep_freq_max", default_value=500.0, width=100, step=0)
-            with dpg.group(horizontal=True):
-                dpg.add_text("No. of frequencies:")
-                dpg.add_input_int(tag="sweep_num_freq", default_value=20, width=100, min_value=2, max_value=200)
-
-            dpg.add_text("")
-            dpg.add_text("Signal Configuration", color=(180, 180, 200))
-            dpg.add_separator()
-
-            # Max Torque (auto-detected, editable)
+                dpg.add_spacer(width=15)
+                dpg.add_text("Points:")
+                dpg.add_input_int(tag="sweep_num_freq", default_value=20, width=80, min_value=2, max_value=200)
             with dpg.group(horizontal=True):
                 dpg.add_text("Max Torque (Nm):")
                 dpg.add_input_float(tag="sweep_max_torque", default_value=25.0, width=100, min_value=0.1, max_value=100.0, step=0)
-                dpg.add_text("(auto-detected)", color=(140, 140, 140))
-
-            # Torque Slider (0-100%) with live Nm readout
-            with dpg.group(horizontal=True):
+                dpg.add_spacer(width=15)
                 dpg.add_text("Torque:")
-                dpg.add_slider_int(tag="sweep_torque_pct", default_value=10, min_value=0, max_value=100, width=300,
+                dpg.add_slider_int(tag="sweep_torque_pct", default_value=10, min_value=0, max_value=100, width=200,
                                    callback=self._on_sweep_torque_slider)
                 dpg.add_text("10% (2.5 Nm)", tag="txt_sweep_torque_readout", color=(180, 220, 180))
-
             with dpg.group(horizontal=True):
-                dpg.add_text("Settling periods:")
-                dpg.add_input_int(tag="sweep_settling", default_value=2, width=80, min_value=0, max_value=4)
+                dpg.add_text("Settle periods:")
+                dpg.add_input_int(tag="sweep_settling", default_value=2, width=70, min_value=0, max_value=4)
                 dpg.add_spacer(width=15)
                 dpg.add_text("Ramp periods:")
-                dpg.add_input_int(tag="sweep_ramp", default_value=1, width=80, min_value=0, max_value=1)
-
-            dpg.add_separator()
-
-            # Frequency list text display and preview
+                dpg.add_input_int(tag="sweep_ramp", default_value=1, width=70, min_value=0, max_value=1)
             with dpg.group(horizontal=True):
-                dpg.add_text("Frequencies:", color=(200, 200, 255))
                 dpg.add_button(label="Preview", width=80, callback=self._sweep_preview_freqs)
-            
-            dpg.add_text("", tag="txt_sweep_freqs", wrap=580, color=(180, 220, 180))
-            
-            # Progress & Log area
+                dpg.add_button(label="Run", tag="btn_sweep_run", width=90, callback=self._sweep_run)
+                dpg.add_button(label="Stop", tag="btn_sweep_cancel", width=80, enabled=False, callback=self._sweep_cancel)
+                dpg.add_button(label="Export", tag="btn_sweep_export", width=80, enabled=False, callback=self._sweep_export)
+            dpg.add_text("", tag="txt_sweep_freqs", wrap=600, color=(180, 220, 180))
             dpg.add_progress_bar(tag="sweep_progress", width=-1, default_value=0.0)
             dpg.add_text("Status: Ready", tag="txt_sweep_status", color=(200, 200, 200))
 
-            # Action buttons
-            with dpg.group(horizontal=True):
-                dpg.add_button(label="Run Sweep", tag="btn_sweep_run", width=120, callback=self._sweep_run)
-                dpg.add_button(label="Cancel", tag="btn_sweep_cancel", width=120, enabled=False, callback=self._sweep_cancel)
-                dpg.add_button(label="Export JSON", tag="btn_sweep_export", width=120, enabled=False, callback=self._sweep_export)
-                dpg.add_button(label="Close", width=80, callback=lambda: dpg.delete_item("win_sweep_v2"))
+            dpg.add_spacer(height=8)
+            dpg.add_separator()
+
+            # --- Bode plots ---
+            dpg.add_text("Bode Plot", color=(200, 200, 255))
+            dpg.add_separator()
+            dpg.add_text("Magnitude (dB)", color=(180, 220, 180))
+            with dpg.plot(label="Magnitude", height=200, width=-1,
+                          anti_aliased=True, no_title=True):
+                dpg.add_plot_axis(dpg.mvXAxis, label="Frequency (Hz)",
+                                  tag="bode_mag_x", scale=dpg.mvPlotScale_Linear)
+                dpg.add_plot_axis(dpg.mvYAxis, label="Magnitude (dB)",
+                                  tag="bode_mag_y")
+                dpg.add_line_series([], [], label="Mag", tag="bode_mag_line",
+                                    parent="bode_mag_y")
+                dpg.add_scatter_series([], [], label="Mag points", tag="bode_mag_series",
+                                       parent="bode_mag_y")
+
+            dpg.add_spacer(height=6)
+            dpg.add_text("Phase (deg)", color=(180, 220, 180))
+            with dpg.plot(label="Phase", height=200, width=-1,
+                          anti_aliased=True, no_title=True):
+                dpg.add_plot_axis(dpg.mvXAxis, label="Frequency (Hz)",
+                                  tag="bode_phase_x", scale=dpg.mvPlotScale_Linear)
+                dpg.add_plot_axis(dpg.mvYAxis, label="Phase (deg)",
+                                  tag="bode_phase_y")
+                dpg.add_line_series([], [], label="Phase", tag="bode_phase_line",
+                                    parent="bode_phase_y")
+                dpg.add_scatter_series([], [], label="Phase points", tag="bode_phase_series",
+                                       parent="bode_phase_y")
+
+            dpg.add_spacer(height=4)
+            dpg.add_text("Points: 0", tag="txt_bode_points", color=(200, 200, 200))
+
+        # Autosize fit the window to its contents, then disable autosize so the
+        # user can still drag to make it larger (autosize locks the size).
+        dpg.configure_item("win_test", autosize=False)
 
         # Initialize sweep engine callbacks
         sweep_engine.set_callbacks(
@@ -1413,6 +1531,7 @@ class MotorBusterNativeApp:
             on_progress=self._sweep_engine_progress,
             on_complete=self._sweep_engine_complete,
             on_log=self._sweep_engine_log,
+            on_check_connection=self._sweep_engine_check_connection,
         )
 
         # Set initial torque values from device detection
@@ -1436,8 +1555,9 @@ class MotorBusterNativeApp:
         """Read sweep panel UI values into a SweepConfig."""
         try:
             config = SweepConfig()
-            config.freq_min_hz = dpg.get_value("sweep_freq_min")
-            config.freq_max_hz = dpg.get_value("sweep_freq_max")
+            # Enforce 30 Hz minimum: below this the firmware w_avg moving average overflows
+            config.freq_min_hz = max(30.0, dpg.get_value("sweep_freq_min"))
+            config.freq_max_hz = max(config.freq_min_hz, dpg.get_value("sweep_freq_max"))
             config.num_frequencies = dpg.get_value("sweep_num_freq")
             
             # Always logarithmic spacing (hardcoded default)
@@ -1453,7 +1573,16 @@ class MotorBusterNativeApp:
             config.settling_periods = dpg.get_value("sweep_settling")
             config.ramp_periods = dpg.get_value("sweep_ramp")
             config.perform_filtering = True  # Always enabled
-            
+
+            # Use the command selector's selected command type for the sweep.
+            # Map the selector label (e.g. "SINE (0x01)") to the effect key.
+            sel = dpg.get_value('cmd_selector') or ''
+            key = sel.split(' ')[0].lower()
+            if key in ('sine', 'constant', 'selftest'):
+                config.command_type = key
+            else:
+                config.command_type = 'sine'
+
             return config
         except Exception as e:
             self.log(f"Sweep config error: {e}")
@@ -1480,11 +1609,76 @@ class MotorBusterNativeApp:
         dpg.set_value("sweep_progress", 0.0)
         dpg.set_value("txt_sweep_status", "Status: Running...")
 
+        # Reset the embedded Bode plots for this sweep
+        self._reset_bode_plot(config)
+
         # Route serial responses to sweep engine
         serial_manager.set_response_callback(sweep_engine.handle_response)
 
         # Start the sweep
         sweep_engine.run_sweep(config)
+
+    def _reset_bode_plot(self, config: SweepConfig):
+        """Reset the embedded Bode plot series and set the X-axis to the sweep range +10%."""
+        if dpg.does_item_exist("bode_mag_line"):
+            dpg.set_value("bode_mag_line", [[], []])
+        if dpg.does_item_exist("bode_mag_series"):
+            dpg.set_value("bode_mag_series", [[], []])
+        if dpg.does_item_exist("bode_phase_line"):
+            dpg.set_value("bode_phase_line", [[], []])
+        if dpg.does_item_exist("bode_phase_series"):
+            dpg.set_value("bode_phase_series", [[], []])
+        if dpg.does_item_exist("txt_bode_points"):
+            dpg.set_value("txt_bode_points", "Points: 0")
+
+        # Set X-axis to the selected frequency range with ~10% padding
+        fmin = config.freq_min_hz
+        fmax = config.freq_max_hz
+        span = max(fmax - fmin, 1.0)
+        x_lo = max(0.0, fmin - span * 0.10)
+        x_hi = fmax + span * 0.10
+        if dpg.does_item_exist("bode_mag_x"):
+            dpg.set_axis_limits("bode_mag_x", x_lo, x_hi)
+        if dpg.does_item_exist("bode_phase_x"):
+            dpg.set_axis_limits("bode_phase_x", x_lo, x_hi)
+
+    def _update_bode_plot(self):
+        """Refresh the Bode plot series from the sweep engine's collected results."""
+        data = sweep_engine.get_data()
+        if data is None:
+            return
+
+        freqs = []
+        mags = []
+        phases = []
+        for r in data.results:
+            if not r.valid:
+                continue
+            freqs.append(r.freq_hz)
+            mags.append(r.mag_db)
+            phases.append(r.phase_deg)
+
+        if dpg.does_item_exist("bode_mag_line"):
+            dpg.set_value("bode_mag_line", [freqs, mags])
+        if dpg.does_item_exist("bode_mag_series"):
+            dpg.set_value("bode_mag_series", [freqs, mags])
+        if dpg.does_item_exist("bode_phase_line"):
+            dpg.set_value("bode_phase_line", [freqs, phases])
+        if dpg.does_item_exist("bode_phase_series"):
+            dpg.set_value("bode_phase_series", [freqs, phases])
+        if dpg.does_item_exist("txt_bode_points"):
+            dpg.set_value("txt_bode_points", f"Points: {len(freqs)}")
+
+        # Auto-scale the Y axes to the dots with ~10% padding
+        if freqs:
+            mag_lo, mag_hi = min(mags), max(mags)
+            ph_lo, ph_hi = min(phases), max(phases)
+            mag_span = max(mag_hi - mag_lo, 1e-6)
+            ph_span = max(ph_hi - ph_lo, 1e-6)
+            if dpg.does_item_exist("bode_mag_y"):
+                dpg.set_axis_limits("bode_mag_y", mag_lo - mag_span * 0.10, mag_hi + mag_span * 0.10)
+            if dpg.does_item_exist("bode_phase_y"):
+                dpg.set_axis_limits("bode_phase_y", ph_lo - ph_span * 0.10, ph_hi + ph_span * 0.10)
 
     def _sweep_cancel(self, sender=None, app_data=None):
         """Cancel the running sweep."""
@@ -1506,8 +1700,17 @@ class MotorBusterNativeApp:
 
     def _sweep_engine_send_stop(self):
         """Called by sweep engine to send stop."""
+        # Stop the FFB driver as well so no haptic output remains active.
+        try:
+            engine.stop_effect()
+        except Exception as e:
+            self.log(f"Stop FFB on sweep end failed: {e}")
         if self.serial_connected:
             serial_manager.send_stop()
+
+    def _sweep_engine_check_connection(self) -> bool:
+        """Called by sweep engine to verify the MCU connection is still alive."""
+        return self.serial_connected and serial_manager.is_connected
 
     def _sweep_engine_progress(self, current: int, total: int, label: str):
         """Called by sweep engine to report progress."""
@@ -1516,10 +1719,16 @@ class MotorBusterNativeApp:
         if dpg.does_item_exist("txt_sweep_status"):
             dpg.set_value("txt_sweep_status", f"Status: {current}/{total} - {label}")
 
+        # Live-update the Bode plot with the latest collected points
+        self._update_bode_plot()
+
     def _sweep_engine_complete(self, data: SweepData):
         """Called by sweep engine on completion."""
         # Restore normal serial callback
         serial_manager.set_response_callback(self._on_serial_response)
+
+        # Final refresh of the Bode plot with all collected points
+        self._update_bode_plot()
 
         if dpg.does_item_exist("txt_sweep_status"):
             status = data.status.capitalize()
@@ -1532,9 +1741,17 @@ class MotorBusterNativeApp:
         if dpg.does_item_exist("btn_sweep_export"):
             dpg.configure_item("btn_sweep_export", enabled=True)
 
-    def _sweep_engine_log(self, msg: str):
-        """Called by sweep engine for log messages."""
-        self.log(f"[Sweep] {msg}")
+    def _sweep_engine_log(self, msg: str, level: str = 'info'):
+        """Called by sweep engine for log messages.
+
+        Only errors are surfaced to the terminal debug console / system log;
+        routine per-frequency sent/received messages are suppressed to avoid
+        flooding the log.
+        """
+        if level == 'error':
+            self._ensure_api_console()
+            print(f"[Sweep] {msg}")
+            self.log(f"[Sweep] {msg}")
 
     # --- Torque Telemetry ---
     def calculate_current_force(self):
@@ -3953,6 +4170,8 @@ class MotorBusterNativeApp:
                 dpg.bind_item_theme("menu_view", "theme_menu_popup")
                 dpg.bind_item_theme("menu_about", "theme_menu_popup")
 
+                dpg.add_button(label="Test", tag="btn_test_window", callback=self._toggle_test_window)
+
                 dpg.add_spacer(width=10)
                 dpg.add_combo(tag="device_combo", width=220, callback=self.on_device_selected)
                 dpg.add_button(label="Scan", callback=self.scan_devices)
@@ -4142,97 +4361,10 @@ class MotorBusterNativeApp:
                         # We use a Tab Bar here to host the single Live Inspector tab
                         # This keeps the look consistent and clean
                         with dpg.tab_bar(tag="inspector_tab_bar"):
-                            # COM Port tab (first - alphabetical)
-                            with dpg.tab(label="COM", tag="tab_com"):
-                                dpg.add_spacer(height=4)
-                                dpg.add_text("Serial Port", color=(200, 200, 255))
-                                dpg.add_separator()
-                                dpg.add_spacer(height=4)
-                                with dpg.group(horizontal=True):
-                                    dpg.add_combo(tag="serial_port_combo", width=220, callback=self._on_serial_port_selected)
-                                    dpg.add_button(label="Scan", callback=self._scan_serial_ports)
-                                dpg.add_spacer(height=3)
-                                with dpg.group(horizontal=True):
-                                    dpg.add_combo(tag="serial_baud_combo", width=100, default_value="115200", items=["9600","19200","38400","57600","115200","230400","460800","921600"], callback=self._on_serial_baud_changed)
-                                    dpg.add_button(label="Connect", tag="btn_serial_connect", callback=self._connect_serial)
-                                dpg.add_spacer(height=6)
-                                dpg.add_text("COM: Offline", tag="txt_serial_status", color=(100, 100, 100))
-                                dpg.add_spacer(height=5)
-                                dpg.add_text("Bode Response:", color=(180, 180, 200))
-                                dpg.add_text("Mag = --- dB | Phase = ---°", tag="txt_serial_timing", color=(200, 200, 200))
-
-                            # Cmd tab (command selector - manual firmware commands)
-                            with dpg.tab(label="Cmd", tag="tab_cmd"):
-                                dpg.add_spacer(height=4)
-                                dpg.add_text("Command Selector", color=(200, 200, 255))
-                                dpg.add_separator()
-                                dpg.add_spacer(height=4)
-                                dpg.add_combo(label="Command", tag="cmd_selector", width=200,
-                                              items=["SINE (0x01)", "CONSTANT (0x06)", "CENTER (0x08)",
-                                                     "SCALE (0x09)", "SELFTEST (0xFE)", "STOP (0xFF)"],
-                                              default_value="SINE (0x01)", callback=self._on_cmd_selector_change)
-                                dpg.add_spacer(height=4)
-                                dpg.add_input_float(label="Frequency (Hz)", tag="cmd_freq", default_value=20.0,
-                                                    min_value=1.0, max_value=10000.0, step=0, width=150)
-                                dpg.add_slider_int(label="Magnitude %", tag="cmd_mag_pct", default_value=10,
-                                                   min_value=0, max_value=100, width=200)
-                                with dpg.group(horizontal=True):
-                                    dpg.add_input_float(label="Max Torque (Nm)", tag="cmd_max_torque",
-                                                        default_value=25.0, min_value=0.1, max_value=100.0,
-                                                        step=0, width=110)
-                                    dpg.add_text("(manual)", color=(140, 140, 140))
-                                with dpg.group(horizontal=True):
-                                    dpg.add_input_int(label="Settle", tag="cmd_settle", default_value=2,
-                                                      min_value=0, max_value=4, width=70)
-                                    dpg.add_spacer(width=8)
-                                    dpg.add_input_int(label="Ramp", tag="cmd_ramp", default_value=1,
-                                                      min_value=0, max_value=1, width=70)
-                                dpg.add_spacer(height=8)
-                                dpg.add_separator()
-                                dpg.add_spacer(height=4)
-                                with dpg.group(horizontal=True):
-                                    dpg.add_button(label="Send", tag="btn_cmd_send", width=90, callback=self._cmd_send)
-                                    dpg.add_button(label="STOP", tag="btn_cmd_stop", width=80, callback=self._cmd_send_stop)
-                                dpg.add_spacer(height=6)
-                                dpg.add_text("Status: idle", tag="txt_cmd_status", wrap=350, color=(180, 220, 180))
-
-                            # Inspector tab (second - loads by default)
+                            # Inspector tab (loads by default)
                             # (built dynamically below via create_floating_inspector)
+                            pass
 
-                            # Sweep tab (third - alphabetical)
-                            with dpg.tab(label="Sweep", tag="tab_sweep"):
-                                dpg.add_text("Frequency Range", color=(200, 200, 255))
-                                dpg.add_separator()
-                                dpg.add_input_float(label="Min (Hz)", tag="sweep_freq_min", default_value=10.0, step=0)
-                                dpg.add_input_float(label="Max (Hz)", tag="sweep_freq_max", default_value=500.0, step=0)
-                                dpg.add_input_int(label="Points", tag="sweep_num_freq", default_value=20, min_value=2, max_value=200)
-                                dpg.add_separator()
-                                dpg.add_text("Signal Configuration", color=(180, 180, 200))
-                                dpg.add_separator()
-                                with dpg.group(horizontal=True):
-                                    dpg.add_input_float(label="Max Torque", tag="sweep_max_torque", default_value=25.0, width=200, min_value=0.1, max_value=100.0, step=0)
-                                    dpg.add_text("(auto)", color=(140, 140, 140))
-                                with dpg.group(horizontal=True):
-                                    dpg.add_slider_int(label="Torque", tag="sweep_torque_pct", default_value=10, min_value=0, max_value=100, width=200, callback=self._on_sweep_torque_slider)
-                                    dpg.add_text("10% (2.5 Nm)", tag="txt_sweep_torque_readout", color=(180, 220, 180))
-                                dpg.add_input_int(label="Settle periods", tag="sweep_settling", default_value=2, min_value=0, max_value=4)
-                                dpg.add_input_int(label="Ramp periods", tag="sweep_ramp", default_value=1, min_value=0, max_value=1)
-                                dpg.add_spacer(height=8)
-                                dpg.add_separator()
-                                dpg.add_spacer(height=4)
-                                with dpg.group(horizontal=True):
-                                    dpg.add_text("Frequencies:", color=(200, 200, 255))
-                                    dpg.add_button(label="Preview", width=80, callback=self._sweep_preview_freqs)
-                                dpg.add_text("", tag="txt_sweep_freqs", wrap=350, color=(180, 220, 180))
-                                dpg.add_spacer(height=4)
-                                dpg.add_progress_bar(tag="sweep_progress", width=-1, default_value=0.0)
-                                dpg.add_spacer(height=3)
-                                dpg.add_text("Status: Ready", tag="txt_sweep_status", color=(200, 200, 200))
-                                dpg.add_spacer(height=6)
-                                dpg.add_button(label="Run", tag="btn_sweep_run", callback=self._sweep_run)
-                                dpg.add_button(label="Stop", tag="btn_sweep_cancel", enabled=False, callback=self._sweep_cancel)
-                                dpg.add_button(label="Export", tag="btn_sweep_export", enabled=False, callback=self._sweep_export)
-            
                     # Log Section (Bottom Half)
                     with dpg.child_window(tag="panel_log", height=-1):
                         dpg.add_text("System Log")

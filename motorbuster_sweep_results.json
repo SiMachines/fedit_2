@@ -1,8 +1,8 @@
 {
   "config": {
-    "freq_min_hz": 50.0,
+    "freq_min_hz": 30.0,
     "freq_max_hz": 500.0,
-    "num_frequencies": 10,
+    "num_frequencies": 20,
     "spacing": "logarithmic",
     "amplitude": 3276,
     "max_torque_nm": 25.0,
@@ -11,66 +11,126 @@
   },
   "results": [
     {
-      "freq_hz": 50.0,
+      "freq_hz": 30.0,
       "mag_db": 1.0,
-      "phase_deg": -13.2401,
+      "phase_deg": -22.5029,
       "valid": true
     },
     {
-      "freq_hz": 64.5774832507442,
+      "freq_hz": 34.78796974089468,
       "mag_db": 1.0,
-      "phase_deg": -13.9432,
+      "phase_deg": -16.9851,
       "valid": true
     },
     {
-      "freq_hz": 83.40502686000293,
+      "freq_hz": 40.34009462311346,
       "mag_db": 1.0,
-      "phase_deg": -16.4128,
+      "phase_deg": -25.2968,
       "valid": true
     },
     {
-      "freq_hz": 107.72173450159418,
+      "freq_hz": 46.77833303645664,
       "mag_db": 1.0,
-      "phase_deg": -14.2069,
+      "phase_deg": -17.6521,
       "valid": true
     },
     {
-      "freq_hz": 139.12797011035622,
+      "freq_hz": 54.244107806724905,
       "mag_db": 1.0,
-      "phase_deg": -17.0242,
+      "phase_deg": -10.8962,
       "valid": true
     },
     {
-      "freq_hz": 179.69068319023137,
+      "freq_hz": 62.9014127000725,
       "mag_db": 1.0,
-      "phase_deg": -7.4694,
+      "phase_deg": -27.5931,
       "valid": true
     },
     {
-      "freq_hz": 232.07944168063898,
+      "freq_hz": 72.94041472232168,
       "mag_db": 1.0,
-      "phase_deg": -16.8389,
+      "phase_deg": -15.336,
       "valid": true
     },
     {
-      "freq_hz": 299.7421251594705,
+      "freq_hz": 84.5816313416145,
       "mag_db": 1.0,
-      "phase_deg": -5.5936,
+      "phase_deg": -8.381,
       "valid": true
     },
     {
-      "freq_hz": 387.13184134056354,
+      "freq_hz": 98.08077439158647,
       "mag_db": 1.0,
-      "phase_deg": 0.2368,
+      "phase_deg": -10.0103,
       "valid": true
     },
     {
-      "freq_hz": 500.0,
+      "freq_hz": 113.73436705660093,
       "mag_db": 1.0,
-      "phase_deg": -1.1564,
+      "phase_deg": -7.3742,
+      "valid": true
+    },
+    {
+      "freq_hz": 131.88625732216138,
+      "mag_db": 1.0,
+      "phase_deg": -7.108,
+      "valid": true
+    },
+    {
+      "freq_hz": 152.93517096543997,
+      "mag_db": 1.0,
+      "phase_deg": -12.9422,
+      "valid": true
+    },
+    {
+      "freq_hz": 177.343469995476,
+      "mag_db": 1.0,
+      "phase_deg": -4.7492,
+      "valid": true
+    },
+    {
+      "freq_hz": 205.64730893159606,
+      "mag_db": 1.0,
+      "phase_deg": -9.2329,
+      "valid": true
+    },
+    {
+      "freq_hz": 238.46841201362614,
+      "mag_db": 1.0,
+      "phase_deg": -15.1918,
+      "valid": true
+    },
+    {
+      "freq_hz": 276.5277300429743,
+      "mag_db": 1.0,
+      "phase_deg": -20.6659,
+      "valid": true
+    },
+    {
+      "freq_hz": 320.66127684177616,
+      "mag_db": 1.0,
+      "phase_deg": -12.0009,
+      "valid": true
+    },
+    {
+      "freq_hz": 371.8384931949453,
+      "mag_db": 1.0,
+      "phase_deg": -8.055,
+      "valid": true
+    },
+    {
+      "freq_hz": 431.18354165885427,
+      "mag_db": 1.0,
+      "phase_deg": -10.5364,
+      "valid": true
+    },
+    {
+      "freq_hz": 500.0000000000008,
+      "mag_db": 1.0,
+      "phase_deg": -5.4289,
       "valid": true
     }
   ],
   "status": "complete",
-  "duration_s": 3.71
+  "duration_s": 10.13
 }
